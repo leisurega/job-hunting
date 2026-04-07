@@ -2,11 +2,16 @@ package com.getjobs.worker.manager;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.getjobs.application.entity.CookieEntity;
+import com.getjobs.application.entity.LiepinEntity;
 import com.getjobs.application.service.CookieService;
+import com.getjobs.application.service.LiepinService;
+import com.getjobs.application.service.JobWorkspaceService;
 import com.microsoft.playwright.*;
 import com.microsoft.playwright.options.Cookie;
 import com.microsoft.playwright.options.WaitUntilState;
 import com.microsoft.playwright.options.LoadState;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.annotation.PreDestroy;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
@@ -77,6 +82,18 @@ public class PlaywrightManager {
     // 控制是否暂停对zhilianPage的后台监控
     private volatile boolean zhilianMonitoringPaused = false;
 
+    // 猎聘拦截到的岗位数据缓存
+    @Getter
+    private final List<LiepinEntity> lastLiepinEntities = new CopyOnWriteArrayList<>();
+
+    // Boss 拦截到的 ID 映射缓存 (encryptId -> encryptUserId)
+    @Getter
+    private final Map<String, String> bossEncryptIdToUserId = new ConcurrentHashMap<>();
+
+    // 51job 拦截到的当前页 JobId 缓存
+    @Getter
+    private final List<Long> lastJob51Ids = new CopyOnWriteArrayList<>();
+
     // 记录智联招聘是否已处理过未登录引导（仅初始化时执行一次）
     private volatile boolean zhilianLoginGuided = false;
 
@@ -103,6 +120,14 @@ public class PlaywrightManager {
 
     @Autowired
     private CookieService cookieService;
+
+    @Autowired
+    @Lazy
+    private LiepinService liepinService;
+
+    @Autowired
+    @Lazy
+    private JobWorkspaceService jobWorkspaceService;
 
     /**
      * 初始化Playwright实例（延迟初始化）
@@ -156,7 +181,15 @@ public class PlaywrightManager {
             zhilianPage.setDefaultTimeout(DEFAULT_TIMEOUT);
             log.info("✓ 智联招聘 Page已创建");
 
-            // 并发执行各平台的初始化逻辑（导航、Cookie加载等）
+            // 统一注册各平台接口响应监听 (仅在初始化时注册一次，避免 prototype bean 多次重复注册)
+            setupLiepinResponseInterceptor(liepinPage);
+            setupBossResponseInterceptor(bossPage);
+            setupJob51ResponseInterceptor(job51Page);
+
+            // 顺序加载各平台 Cookie（避免并发操作 BrowserContext 导致的竞态异常）
+            loadAllPlatformCookies();
+
+            // 并发执行各平台的导航与监控初始化逻辑
             log.info("开始并发初始化所有平台...");
             CompletableFuture<Void> bossFuture = CompletableFuture.runAsync(this::setupBossPlatform);
             CompletableFuture<Void> liepinFuture = CompletableFuture.runAsync(this::setupLiepinPlatform);
@@ -203,30 +236,156 @@ public class PlaywrightManager {
     }
 
     /**
-     * 设置Boss直聘平台（加载Cookie、导航、监控）
+     * 统一注册猎聘接口响应拦截器
+     */
+    private void setupLiepinResponseInterceptor(Page page) {
+        page.onResponse((Response response) -> {
+            try {
+                // 检查响应对象是否有效（Playwright 在并发时可能会出现“Object doesn't exist”）
+                if (response == null) return;
+                
+                String url = response.url();
+                if (url != null && response.status() == 200 &&
+                        url.contains("com.liepin.searchfront4c.pc-search-job") &&
+                        !url.contains("com.liepin.searchfront4c.pc-search-job-cond-init")) {
+                    
+                    log.info("[拦截][响应] {}", url);
+                    String contentType = null;
+                    try { contentType = response.headers().get("content-type"); } catch (Exception ignored) {}
+                    
+                    if (contentType == null || contentType.contains("application/json")) {
+                        String text = null;
+                        try {
+                            text = response.text();
+                        } catch (Exception e) {
+                            log.debug("读取猎聘响应文本失败（可能是响应对象已失效）: {}", e.getMessage());
+                            return;
+                        }
+                        
+                        if (text != null && !text.isEmpty()) {
+                            parseAndPersistLiepinData(text);
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                log.warn("猎聘接口响应拦截器异常: {}", e.getMessage());
+            }
+        });
+        log.info("✓ 猎聘接口响应拦截器已注册");
+    }
+
+    private void parseAndPersistLiepinData(String json) {
+        try {
+            ObjectMapper mapper = new ObjectMapper();
+            JsonNode root = mapper.readTree(json);
+            JsonNode cardList = root.path("data").path("data").path("jobCardList");
+            if (!cardList.isArray()) {
+                cardList = root.path("data").path("jobCardList");
+            }
+            if (!cardList.isArray()) {
+                return;
+            }
+
+            List<LiepinEntity> newEntities = new ArrayList<>();
+            for (JsonNode item : cardList) {
+                JsonNode job = item.path("job");
+                JsonNode comp = item.path("comp");
+                JsonNode recruiter = item.path("recruiter");
+
+                Long jobId = parseLong(job.path("jobId"));
+                if (jobId == null) continue;
+
+                LiepinEntity entity = new LiepinEntity();
+                entity.setJobId(jobId);
+                entity.setJobTitle(parseText(job.path("title")));
+                entity.setJobLink(parseText(job.path("link")));
+                entity.setJobSalaryText(parseText(job.path("salary")));
+                entity.setJobArea(parseText(job.path("dq")));
+                entity.setJobEduReq(parseText(job.path("requireEduLevel")));
+                entity.setJobExpReq(parseText(job.path("requireWorkYears")));
+                entity.setJobPublishTime(parseText(job.path("refreshTime")));
+
+                entity.setCompId(parseLong(comp.path("compId")));
+                entity.setCompName(parseText(comp.path("compName")));
+                entity.setCompIndustry(parseText(comp.path("compIndustry")));
+                entity.setCompScale(parseText(comp.path("compScale")));
+
+                entity.setHrId(parseText(recruiter.path("recruiterId")));
+                entity.setHrName(parseText(recruiter.path("recruiterName")));
+                entity.setHrTitle(parseText(recruiter.path("recruiterTitle")));
+                entity.setHrImId(parseText(recruiter.path("imId")));
+
+                newEntities.add(entity);
+            }
+
+            // 更新缓存
+            lastLiepinEntities.clear();
+            lastLiepinEntities.addAll(newEntities);
+
+            // 批量持久化
+            if (liepinService != null) {
+                try {
+                    liepinService.insertSnapshotsIfNotExistsBatch(newEntities);
+                    log.info("已捕获猎聘 {} 条岗位数据并存入数据库", newEntities.size());
+                } catch (Exception e) {
+                    log.warn("批量保存猎聘岗位数据失败: {}", e.getMessage());
+                }
+            }
+        } catch (Exception e) {
+            log.warn("解析猎聘JSON失败: {}", e.getMessage());
+        }
+    }
+
+    private String parseText(JsonNode node) {
+        if (node == null || node.isMissingNode() || node.isNull()) return null;
+        String v = node.asText();
+        return (v == null || v.isEmpty()) ? null : v;
+    }
+
+    private Long parseLong(JsonNode node) {
+        if (node == null || node.isMissingNode() || node.isNull()) return null;
+        try {
+            if (node.isNumber()) return node.asLong() == 0 ? null : node.asLong();
+            if (node.isTextual()) {
+                String t = node.asText().trim();
+                return t.isEmpty() ? null : Long.parseLong(t);
+            }
+        } catch (Exception ignored) {}
+        return null;
+    }
+
+    /**
+     * 顺序加载所有平台的 Cookie
+     */
+    private void loadAllPlatformCookies() {
+        log.info("正在顺序加载各平台 Cookie...");
+        loadCookieForPlatform("boss", BOSS_DOMAIN);
+        loadCookieForPlatform("liepin", LIEPIN_DOMAIN);
+        loadCookieForPlatform("51job", JOB51_DOMAIN);
+        loadCookieForPlatform("zhilian", ZHILIAN_DOMAIN);
+    }
+
+    private void loadCookieForPlatform(String platform, String domain) {
+        try {
+            CookieEntity cookieEntity = cookieService.getCookieByPlatform(platform);
+            if (cookieEntity != null && cookieEntity.getCookieValue() != null && !cookieEntity.getCookieValue().isBlank()) {
+                List<Cookie> cookies = filterCookiesByDomain(parseCookiesFromString(cookieEntity.getCookieValue()), domain);
+                if (!cookies.isEmpty()) {
+                    context.addCookies(cookies);
+                    log.info("✓ 已从数据库加载 {} Cookie，共 {} 条", platform, cookies.size());
+                }
+            }
+        } catch (Exception e) {
+            log.warn("✗ 加载 {} Cookie 失败: {}", platform, e.getMessage());
+        }
+    }
+
+    /**
+     * 设置Boss直聘平台（导航、监控）
      */
     private void setupBossPlatform() {
         log.info("开始初始化Boss直聘平台...");
-        // 尝试从数据库加载Boss平台Cookie到上下文
-        try {
-            CookieEntity cookieEntity = cookieService.getCookieByPlatform("boss");
-            if (cookieEntity != null && cookieEntity.getCookieValue() != null && !cookieEntity.getCookieValue().isBlank()) {
-                String cookieStr = cookieEntity.getCookieValue();
-                List<Cookie> cookies = filterCookiesByDomain(parseCookiesFromString(cookieStr), BOSS_DOMAIN);
-
-                if (!cookies.isEmpty()) {
-                    context.addCookies(cookies);
-                    log.info("已从数据库加载Boss Cookie并注入浏览器上下文，共 {} 条", cookies.size());
-                } else {
-                    log.warn("解析Cookie失败，未能加载任何Cookie");
-                }
-            } else {
-                log.info("数据库未找到Boss Cookie或值为空，跳过Cookie注入");
-            }
-        } catch (Exception e) {
-            log.warn("从数据库加载Boss Cookie失败: {}", e.getMessage());
-        }
-
+        
         // 导航到Boss直聘首页（带重试机制）
         int maxRetries = 3;
         boolean navigateSuccess = false;
@@ -320,9 +479,115 @@ public class PlaywrightManager {
     }
 
     /**
-     * 设置登录状态监控
-     *
-     * @param page 页面实例
+     * 统一注册 Boss 接口响应拦截器
+     */
+    private void setupBossResponseInterceptor(Page page) {
+        page.onResponse((Response response) -> {
+            try {
+                if (response == null) return;
+                String url = response.url();
+                if (url != null && response.status() == 200 &&
+                        url.contains("/wapi/zpgeek/job/detail.json") &&
+                        "GET".equalsIgnoreCase(response.request().method())) {
+                    
+                    String text = null;
+                    try {
+                        text = response.text();
+                    } catch (Exception e) {
+                        log.debug("读取 Boss 响应文本失败（可能是响应对象已失效）: {}", e.getMessage());
+                        return;
+                    }
+                    
+                    if (text != null && !text.isEmpty()) {
+                        parseBossJobDetail(text);
+                    }
+                }
+            } catch (Exception e) {
+                log.warn("Boss 接口响应拦截器异常: {}", e.getMessage());
+            }
+        });
+        log.info("✓ Boss 接口响应拦截器已注册");
+    }
+
+    private void parseBossJobDetail(String json) {
+        try {
+            ObjectMapper mapper = new ObjectMapper();
+            JsonNode root = mapper.readTree(json);
+            JsonNode zpData = root.path("zpData");
+            JsonNode jobInfo = zpData.path("jobInfo");
+            
+            if (!jobInfo.isMissingNode() && !jobInfo.isNull()) {
+                String encryptId = parseText(jobInfo.path("encryptId"));
+                String encryptUserId = parseText(jobInfo.path("encryptUserId"));
+                
+                if (encryptId != null && encryptUserId != null) {
+                    bossEncryptIdToUserId.put(encryptId, encryptUserId);
+                    log.debug("已捕获 Boss ID 映射: {} -> {}", encryptId, encryptUserId);
+                }
+            }
+        } catch (Exception e) {
+            log.warn("解析 Boss 岗位详情 JSON 失败: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * 统一注册 51job 接口响应拦截器
+     */
+    private void setupJob51ResponseInterceptor(Page page) {
+        page.onResponse((Response response) -> {
+            try {
+                if (response == null) return;
+                String url = response.url();
+                if (url != null && url.contains("/api/job/search-pc") && "GET".equalsIgnoreCase(response.request().method())) {
+                    if (response.status() != 200) return;
+                    
+                    String text = null;
+                    try {
+                        text = response.text();
+                    } catch (Exception e) {
+                        log.debug("读取 51job 响应文本失败（可能是响应对象已失效）: {}", e.getMessage());
+                        return;
+                    }
+                    
+                    if (text != null && !text.isEmpty()) {
+                        parseAndPersistJob51Data(text);
+                    }
+                }
+            } catch (Exception e) {
+                log.warn("51job 接口响应拦截器异常: {}", e.getMessage());
+            }
+        });
+        log.info("✓ 51job 接口响应拦截器已注册");
+    }
+
+    private void parseAndPersistJob51Data(String json) {
+        try {
+            ObjectMapper mapper = new ObjectMapper();
+            JsonNode root = mapper.readTree(json);
+            JsonNode resultBody = root.path("resultbody");
+            JsonNode jobList = resultBody.path("jobList");
+            if (!jobList.isArray()) return;
+
+            List<Long> pageIds = new ArrayList<>();
+            for (JsonNode item : jobList) {
+                Long jobId = parseLong(item.path("jobId"));
+                if (jobId != null) {
+                    pageIds.add(jobId);
+                }
+            }
+            
+            // 更新缓存（这里仅保留最新一次页面的 ID，模拟原 Job51.java 逻辑）
+            lastJob51Ids.clear();
+            lastJob51Ids.addAll(pageIds);
+            
+            log.info("已捕获 51job {} 条岗位数据", pageIds.size());
+        } catch (Exception e) {
+            log.warn("解析 51job 岗位 JSON 失败: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * 统一注册各平台登录监控
      */
     private void setupLoginMonitoring(Page page) {
         // 监听页面导航事件，检测URL变化
@@ -339,30 +604,10 @@ public class PlaywrightManager {
     }
 
     /**
-     * 设置猎聘平台（加载Cookie、导航、监控）
+     * 设置猎聘平台（导航、监控）
      */
     private void setupLiepinPlatform() {
         log.info("开始初始化猎聘平台...");
-
-        // 尝试从数据库加载猎聘平台Cookie到上下文
-        try {
-            CookieEntity cookieEntity = cookieService.getCookieByPlatform("liepin");
-            if (cookieEntity != null && cookieEntity.getCookieValue() != null && !cookieEntity.getCookieValue().isBlank()) {
-                String cookieStr = cookieEntity.getCookieValue();
-                List<Cookie> cookies = filterCookiesByDomain(parseCookiesFromString(cookieStr), LIEPIN_DOMAIN);
-
-                if (!cookies.isEmpty()) {
-                    context.addCookies(cookies);
-                    log.info("已从数据库加载猎聘 Cookie并注入浏览器上下文，共 {} 条", cookies.size());
-                } else {
-                    log.warn("解析猎聘Cookie失败，未能加载任何Cookie");
-                }
-            } else {
-                log.info("数据库未找到猎聘Cookie或值为空，跳过Cookie注入");
-            }
-        } catch (Exception e) {
-            log.warn("从数据库加载猎聘Cookie失败: {}", e.getMessage());
-        }
 
         // 导航到猎聘首页（带重试机制）
         int maxRetries = 3;
@@ -518,30 +763,10 @@ public class PlaywrightManager {
     }
 
     /**
-     * 设置51job平台（加载Cookie、导航、监控）
+     * 设置51job平台（导航、监控）
      */
     private void setup51jobPlatform() {
         log.info("开始初始化51job平台...");
-
-        // 尝试从数据库加载51job平台Cookie到上下文
-        try {
-            CookieEntity cookieEntity = cookieService.getCookieByPlatform("51job");
-            if (cookieEntity != null && cookieEntity.getCookieValue() != null && !cookieEntity.getCookieValue().isBlank()) {
-                String cookieStr = cookieEntity.getCookieValue();
-                List<Cookie> cookies = filterCookiesByDomain(parseCookiesFromString(cookieStr), JOB51_DOMAIN);
-
-                if (!cookies.isEmpty()) {
-                    context.addCookies(cookies);
-                    log.info("已从数据库加载51job Cookie并注入浏览器上下文，共 {} 条", cookies.size());
-                } else {
-                    log.warn("解析51job Cookie失败，未能加载任何Cookie");
-                }
-            } else {
-                log.info("数据库未找到51job Cookie或值为空，跳过Cookie注入");
-            }
-        } catch (Exception e) {
-            log.warn("从数据库加载51job Cookie失败: {}", e.getMessage());
-        }
 
         // 导航到51job首页（带重试机制）
         int maxRetries = 3;
@@ -875,30 +1100,10 @@ public class PlaywrightManager {
     }
 
     /**
-     * 设置智联招聘平台（加载Cookie、导航、监控）
+     * 设置智联招聘平台（导航、监控）
      */
     private void setupZhilianPlatform() {
         log.info("开始初始化智联招聘平台...");
-
-        // 尝试从数据库加载智联招聘平台Cookie到上下文
-        try {
-            CookieEntity cookieEntity = cookieService.getCookieByPlatform("zhilian");
-            if (cookieEntity != null && cookieEntity.getCookieValue() != null && !cookieEntity.getCookieValue().isBlank()) {
-                String cookieStr = cookieEntity.getCookieValue();
-                List<Cookie> cookies = filterCookiesByDomain(parseCookiesFromString(cookieStr), ZHILIAN_DOMAIN);
-
-                if (!cookies.isEmpty()) {
-                    context.addCookies(cookies);
-                    log.info("已从数据库加载智联招聘 Cookie并注入浏览器上下文，共 {} 条", cookies.size());
-                } else {
-                    log.warn("解析智联招聘Cookie失败，未能加载任何Cookie");
-                }
-            } else {
-                log.info("数据库未找到智联招聘Cookie或值为空，跳过Cookie注入");
-            }
-        } catch (Exception e) {
-            log.warn("从数据库加载智联招聘Cookie失败: {}", e.getMessage());
-        }
 
         // 导航到智联招聘首页（带重试机制）
         int maxRetries = 3;

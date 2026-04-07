@@ -12,9 +12,11 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.util.HashMap;
 import java.util.Map;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
 
 /**
@@ -292,9 +294,7 @@ public class LiepinController {
         }
     }
 
-    /**
-     * 退出登录：清空数据库Cookie并清理运行中的上下文Cookie
-     */
+    /** 退出登录：清空数据库Cookie并清理运行中的上下文Cookie */
     @PostMapping("/logout")
     public ResponseEntity<Map<String, Object>> logoutLiepin() {
         Map<String, Object> response = new HashMap<>();
@@ -323,9 +323,19 @@ public class LiepinController {
         }
     }
 
-    /**
-     * 调试接口：主动保存当前上下文中的猎聘 Cookie 到数据库
-     */
+    /** 删除岗位记录 */
+    @DeleteMapping("/{id}")
+    public boolean delete(@PathVariable Long id) {
+        return liepinService.delete(id);
+    }
+
+    /** 批量删除岗位记录 */
+    @PostMapping("/batch-delete")
+    public boolean batchDelete(@RequestBody List<Long> ids) {
+        return liepinService.deleteBatch(ids);
+    }
+
+    /** 调试接口：主动保存当前上下文中的猎聘 Cookie 到数据库 */
     @PostMapping("/save-cookie")
     public ResponseEntity<Map<String, Object>> saveLiepinCookie() {
         Map<String, Object> response = new HashMap<>();

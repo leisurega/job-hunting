@@ -1,17 +1,21 @@
 package com.getjobs.application.service;
 
+import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
 import com.getjobs.application.entity.Job51ConfigEntity;
 import com.getjobs.application.entity.Job51Entity;
 import com.getjobs.application.entity.Job51OptionEntity;
+import com.getjobs.application.entity.JobWorkspaceEntity;
 import com.getjobs.application.mapper.Job51ConfigMapper;
 import com.getjobs.application.mapper.Job51Mapper;
 import com.getjobs.application.mapper.Job51OptionMapper;
+import com.getjobs.application.mapper.JobWorkspaceMapper;
 import com.getjobs.worker.job51.Job51Config;
 import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 import javax.sql.DataSource;
 import java.sql.Connection;
@@ -19,6 +23,7 @@ import java.sql.Statement;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.stream.Collectors;
 
 @Service
@@ -28,6 +33,7 @@ public class Job51Service {
     private final Job51ConfigMapper job51ConfigMapper;
     private final Job51OptionMapper job51OptionMapper;
     private final Job51Mapper job51Mapper;
+    private final JobWorkspaceMapper jobWorkspaceMapper;
     private final DataSource dataSource;
 
     /** 获取第一条配置（通常只有一条） */
@@ -525,6 +531,11 @@ public class Job51Service {
         public String createdAt;
         public String industry;
         public String companyScale;
+        public String aiGap;
+        public String aiPlan;
+        public String analysisStatus;
+        public Integer relevanceScore;
+        public String relevanceReason;
     }
     public static class PagedResult51 {
         public java.util.List<Job51Row> items;
@@ -715,8 +726,20 @@ public class Job51Service {
         int to = Math.min(total, from + size);
         java.util.List<Job51Entity> pageItems = from >= to ? java.util.Collections.emptyList() : filtered.subList(from, to);
 
+        // 关联 AI 分析结果
+        Map<String, JobWorkspaceEntity> analysisMap = new java.util.HashMap<>();
+        if (!pageItems.isEmpty()) {
+            List<String> extIds = pageItems.stream().map(it -> String.valueOf(it.getJobId())).collect(Collectors.toList());
+            LambdaQueryWrapper<JobWorkspaceEntity> workspaceWrapper = new LambdaQueryWrapper<>();
+            workspaceWrapper.eq(JobWorkspaceEntity::getPlatform, "51job")
+                            .in(JobWorkspaceEntity::getExternalId, extIds);
+            List<JobWorkspaceEntity> analysisList = jobWorkspaceMapper.selectList(workspaceWrapper);
+            analysisMap = analysisList.stream()
+                    .collect(Collectors.toMap(JobWorkspaceEntity::getExternalId, a -> a, (a1, a2) -> a1));
+        }
+
         java.util.List<Job51Row> rows = new java.util.ArrayList<>();
-        for (Job51Entity e : pageItems) {
+            for (Job51Entity e : pageItems) {
             Job51Row r = new Job51Row();
             r.jobId = e.getJobId();
             r.companyName = e.getCompName();
@@ -732,6 +755,17 @@ public class Job51Service {
             r.createdAt = e.getCreateTime();
             r.industry = e.getCompIndustry();
             r.companyScale = e.getCompScale();
+
+            // 填充 AI 字段
+            JobWorkspaceEntity analysis = analysisMap.get(String.valueOf(e.getJobId()));
+            if (analysis != null) {
+                r.aiGap = analysis.getAiGap();
+                r.aiPlan = analysis.getAiPlan();
+                r.analysisStatus = analysis.getAnalysisStatus();
+                r.relevanceScore = analysis.getRelevanceScore();
+                r.relevanceReason = analysis.getRelevanceReason();
+            }
+            
             rows.add(r);
         }
 
@@ -804,5 +838,33 @@ public class Job51Service {
         try (java.sql.Statement st = conn.createStatement(); java.sql.ResultSet rs = st.executeQuery(sql)) {
             return rs.next() ? rs.getLong(1) : 0L;
         }
+    }
+
+    /**
+     * 删除岗位记录
+     */
+    @Transactional
+    public boolean delete(Long jobId) {
+        // 级联删除 job_workspace
+        LambdaQueryWrapper<JobWorkspaceEntity> jw = new LambdaQueryWrapper<>();
+        jw.eq(JobWorkspaceEntity::getPlatform, "51job").eq(JobWorkspaceEntity::getExternalId, String.valueOf(jobId));
+        jobWorkspaceMapper.delete(jw);
+
+        return job51Mapper.deleteById(jobId) > 0;
+    }
+
+    /**
+     * 批量删除岗位记录
+     */
+    @Transactional
+    public boolean deleteBatch(List<Long> jobIds) {
+        if (jobIds == null || jobIds.isEmpty()) return true;
+
+        List<String> extIds = jobIds.stream().map(String::valueOf).collect(Collectors.toList());
+        LambdaQueryWrapper<JobWorkspaceEntity> jw = new LambdaQueryWrapper<>();
+        jw.eq(JobWorkspaceEntity::getPlatform, "51job").in(JobWorkspaceEntity::getExternalId, extIds);
+        jobWorkspaceMapper.delete(jw);
+
+        return job51Mapper.deleteBatchIds(jobIds) > 0;
     }
 }

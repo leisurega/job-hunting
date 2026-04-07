@@ -517,6 +517,18 @@ public class JobController {
     @GetMapping("/51job/reload")
     public Map<String, Object> reload() { return job51Service.reloadJob51Data(); }
 
+    /** 删除岗位记录 */
+    @DeleteMapping("/51job/{id}")
+    public boolean delete(@PathVariable Long id) {
+        return job51Service.delete(id);
+    }
+
+    /** 批量删除岗位记录 */
+    @PostMapping("/51job/batch-delete")
+    public boolean batchDelete(@RequestBody List<Long> ids) {
+        return job51Service.deleteBatch(ids);
+    }
+
     // ==================== 辅助方法 ====================
 
     private String toBracketListString(List<String> list) {

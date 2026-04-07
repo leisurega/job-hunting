@@ -1,5 +1,6 @@
 package com.getjobs.worker.service;
 
+import com.getjobs.application.service.BossService;
 import com.getjobs.application.service.ConfigService;
 import com.getjobs.worker.boss.Boss;
 import com.getjobs.worker.boss.BossConfig;
@@ -28,11 +29,19 @@ public class BossJobService implements JobPlatformService {
     private final PlaywrightManager playwrightManager;
     private final ConfigService configService;
     private final ObjectProvider<Boss> bossProvider;
+    private final BossService bossService;
 
     // 任务运行状态
     private volatile boolean isRunning = false;
     // 停止标志
     private volatile boolean shouldStop = false;
+
+    /**
+     * 删除岗位记录
+     */
+    public boolean delete(String encryptId) {
+        return bossService.deleteBossJob(encryptId);
+    }
 
     @Override
     public void executeDelivery(Consumer<JobProgressMessage> progressCallback) {

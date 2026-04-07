@@ -40,7 +40,6 @@ public class Liepin {
 
     private int maxPage = 50;
     private final List<String> resultList = new ArrayList<>();
-    private final List<LiepinEntity> lastApiEntities = new ArrayList<>();
     private boolean monitoringRegistered = false;
     @Setter
     private LiepinConfig config;
@@ -50,6 +49,12 @@ public class Liepin {
     private Page page;
     @Autowired
     private LiepinService liepinService;
+    @Autowired
+    private com.getjobs.application.service.JobWorkspaceService jobWorkspaceService;
+    @Autowired
+    private com.getjobs.application.service.AiService aiService;
+    @Autowired
+    private com.getjobs.worker.manager.PlaywrightManager playwrightManager;
 
     public interface ProgressCallback {
         void onProgress(String message, Integer current, Integer total);
@@ -63,42 +68,7 @@ public class Liepin {
     public void prepare() {
         this.startDate = new Date();
         this.resultList.clear();
-
-        // 监控猎聘接口请求与返回，输出被拦截的URL（精确匹配PC搜索相关接口）
-        if (page != null && !monitoringRegistered) {
-            // 请求拦截日志（仅搜索岗位接口）
-            page.onRequest(req -> {
-                try {
-                    String url = req.url();
-                    if (url != null && url.contains("com.liepin.searchfront4c.pc-search-job")
-                            && !url.contains("com.liepin.searchfront4c.pc-search-job-cond-init")) {
-                        // log.info("[拦截][请求] {}", url);
-                    }
-                } catch (Exception ignored) {}
-            });
-            page.onResponse((Response response) -> {
-                try {
-                    String url = response.url();
-                    if (url != null && response.status() == 200 &&
-                            url.contains("com.liepin.searchfront4c.pc-search-job") &&
-                            !url.contains("com.liepin.searchfront4c.pc-search-job-cond-init")) {
-                        log.info("[拦截][响应] {}", url);
-                        String contentType = null;
-                        try { contentType = response.headers().get("content-type"); } catch (Exception ignored) {}
-                        if (contentType == null || contentType.contains("application/json")) {
-                            String text = response.text();
-                            if (text != null && !text.isEmpty()) {
-                                // 尝试解析，若结构不符合则在方法内直接返回
-                                parseAndPersistLiepinData(text);
-                            }
-                        }
-                    }
-                } catch (Exception e) {
-                    log.warn("监控猎聘接口响应时发生错误: {}", e.getMessage());
-                }
-            });
-            monitoringRegistered = true;
-        }
+        // 监控由 PlaywrightManager 统一注册，此处不再重复
     }
 
     public int execute() {
@@ -128,92 +98,12 @@ public class Liepin {
         return resultList.size();
     }
 
-    // ========== 解析接口JSON并保存到数据库 ==========
-    private void parseAndPersistLiepinData(String json) {
-        try {
-            ObjectMapper mapper = new ObjectMapper();
-            JsonNode root = mapper.readTree(json);
-            // 兼容两种结构：data.data.jobCardList 或 data.jobCardList
-            JsonNode cardList = root.path("data").path("data").path("jobCardList");
-            if (!cardList.isArray()) {
-                cardList = root.path("data").path("jobCardList");
-            }
-            if (!cardList.isArray()) {
-                return;
-            }
-            lastApiEntities.clear();
-            for (JsonNode item : cardList) {
-                JsonNode job = item.path("job");
-                JsonNode comp = item.path("comp");
-                JsonNode recruiter = item.path("recruiter");
-
-                Long jobId = readLong(job.path("jobId"));
-                if (jobId == null) {
-                    continue;
-                }
-
-                LiepinEntity entity = new LiepinEntity();
-                entity.setJobId(jobId);
-                entity.setJobTitle(readText(job.path("title")));
-                entity.setJobLink(readText(job.path("link")));
-                entity.setJobSalaryText(readText(job.path("salary")));
-                entity.setJobArea(readText(job.path("dq")));
-                entity.setJobEduReq(readText(job.path("requireEduLevel")));
-                entity.setJobExpReq(readText(job.path("requireWorkYears")));
-                entity.setJobPublishTime(readText(job.path("refreshTime")));
-
-                entity.setCompId(readLong(comp.path("compId")));
-                entity.setCompName(readText(comp.path("compName")));
-                entity.setCompIndustry(readText(comp.path("compIndustry")));
-                entity.setCompScale(readText(comp.path("compScale")));
-
-                entity.setHrId(readText(recruiter.path("recruiterId")));
-                entity.setHrName(readText(recruiter.path("recruiterName")));
-                entity.setHrTitle(readText(recruiter.path("recruiterTitle")));
-                entity.setHrImId(readText(recruiter.path("imId")));
-
-                // 缓存到内存供页面投递显示使用（避免从页面读取文本）
-                lastApiEntities.add(entity);
-            }
-            // 批量持久化：仅不存在时插入，默认 delivered=0
-            try {
-                liepinService.insertSnapshotsIfNotExistsBatch(lastApiEntities);
-            } catch (Exception e) {
-                log.warn("批量保存猎聘岗位数据失败: {}", e.getMessage());
-            }
-        } catch (Exception e) {
-            log.warn("解析猎聘JSON失败: {}", e.getMessage());
-        }
-    }
-
-    private String readText(JsonNode node) {
-        if (node == null || node.isMissingNode() || node.isNull()) return null;
-        String v = node.asText();
-        return (v == null || v.isEmpty()) ? null : v;
-    }
-
-    private Long readLong(JsonNode node) {
-        if (node == null || node.isMissingNode() || node.isNull()) return null;
-        try {
-            if (node.isNumber()) {
-                long v = node.asLong();
-                return v == 0 ? null : v;
-            }
-            if (node.isTextual()) {
-                String t = node.asText();
-                if (t == null || t.isEmpty()) return null;
-                long v = Long.parseLong(t.trim());
-                return v == 0 ? null : v;
-            }
-        } catch (Exception ignored) {}
-        return null;
-    }
-
     private String safeText(String s) {
         if (s == null) return null;
         return s.replaceAll("\n", " ").replaceAll("【 ", "[").replaceAll(" 】", "]");
     }
 
+    // ========== 停止状态检查 ==========
     private boolean shouldStop() {
         return shouldStopCallback != null && Boolean.TRUE.equals(shouldStopCallback.get());
     }
@@ -229,7 +119,20 @@ public class Liepin {
     private void submit(String keyword) {
         // 清洗关键词：去掉前后引号与多余空白
         String cleanKeyword = keyword == null ? "" : keyword.replace("\"", "").trim();
-        page.navigate(getSearchUrl() + "&key=" + cleanKeyword);
+        String searchUrl = getSearchUrl() + "&key=" + cleanKeyword;
+        
+        // 导航带重试机制，应对 Playwright 并发导致的 Object doesn't exist 异常
+        int maxRetries = 3;
+        for (int attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                page.navigate(searchUrl, new Page.NavigateOptions().setTimeout(60000));
+                break;
+            } catch (Exception e) {
+                log.warn("猎聘搜索页跳转失败 (尝试 {}/{}): {}", attempt, maxRetries, e.getMessage());
+                if (attempt == maxRetries) throw e;
+                PlaywrightUtil.sleep(2);
+            }
+        }
         
         // 等待分页元素加载
         page.waitForSelector(PAGINATION_BOX, new Page.WaitForSelectorOptions().setTimeout(10000));
@@ -258,7 +161,7 @@ public class Liepin {
                 .setState(WaitForSelectorState.ATTACHED)
                 .setTimeout(15000)
         );
-            // 额外等待一次接口响应，确保 lastApiEntities 刷新（精确匹配PC搜索接口）
+            // 额外等待一次接口响应，确保数据刷新（精确匹配PC搜索接口）
             try {
                 page.waitForResponse(r -> {
                     try {
@@ -335,13 +238,14 @@ public class Liepin {
             }
             // 获取当前岗位卡片（用于后续操作与缺省展示）
             Locator currentJobCard = page.locator(JOB_CARDS).nth(i);
-            // 从接口数据获取展示所需字段，若接口数据缺失则使用缺省占位，仍尝试打招呼
+            // 从 PlaywrightManager 获取接口数据
+            List<LiepinEntity> entities = playwrightManager.getLastLiepinEntities();
             String jobName = null;
             String companyName = null;
             String salary = null;
             String recruiterName = null;
-            if (i < lastApiEntities.size()) {
-                LiepinEntity apiEntity = lastApiEntities.get(i);
+            if (i < entities.size()) {
+                LiepinEntity apiEntity = entities.get(i);
                 jobName = safeText(apiEntity.getJobTitle());
                 companyName = safeText(apiEntity.getCompName());
                 salary = safeText(apiEntity.getJobSalaryText());
@@ -353,6 +257,39 @@ public class Liepin {
             if (salary == null) salary = "";
             
             try {
+                // 1. 获取详情链接并处理工作台同步 (JD分析与去重)
+                if (i < entities.size()) {
+                    LiepinEntity apiEntity = entities.get(i);
+                    String jobLink = apiEntity.getJobLink();
+                    if (jobLink != null && !jobLink.isEmpty()) {
+                        // 打开详情页获取 JD
+                        Page detailPage = page.context().newPage();
+                        try {
+                            detailPage.navigate(jobLink, new Page.NavigateOptions().setTimeout(15000));
+                            // 等待 JD 文本容器，猎聘常见 JD 选择器
+                            detailPage.waitForSelector(".job-description-box, .job-intro-container, .post-jd", new Page.WaitForSelectorOptions().setTimeout(10000));
+                            String jdText = detailPage.locator(".job-description-box, .job-intro-container, .post-jd").innerText();
+                            
+                            // 同步到工作台
+                            jobWorkspaceService.processJob(
+                                "liepin",
+                                String.valueOf(apiEntity.getJobId()),
+                                apiEntity.getJobTitle(),
+                                apiEntity.getCompName(),
+                                jdText,
+                                jobLink,
+                                apiEntity.getJobSalaryText(),
+                                apiEntity.getJobArea()
+                            );
+                        } catch (Exception e) {
+                            log.warn("获取猎聘 JD 详情失败: {} | {}", jobLink, e.getMessage());
+                        } finally {
+                            detailPage.close();
+                        }
+                    }
+                }
+
+                // 2. 模拟鼠标悬停 (保留原有投递辅助逻辑)
                 // 使用JavaScript滚动到卡片位置，更稳定
                 try {
                     // 先滚动到卡片位置
@@ -499,79 +436,24 @@ public class Liepin {
             
             // 提取 jobId（用于更新投递状态）
             Long jobIdForUpdate = null;
-            if (i < lastApiEntities.size()) {
-                jobIdForUpdate = lastApiEntities.get(i).getJobId();
+            List<LiepinEntity> entitiesForId = playwrightManager.getLastLiepinEntities();
+            if (i < entitiesForId.size()) {
+                jobIdForUpdate = entitiesForId.get(i).getJobId();
             }
             if (jobIdForUpdate == null) {
                 jobIdForUpdate = extractJobIdFromCard(currentJobCard);
             }
 
-            // 检查按钮文本并点击
+            // 检查按钮文本并禁用自动点击
             if (button != null && buttonText.contains("聊一聊")) {
                 try {
-                    // 在点击按钮前进行鼠标微调，先向右移动2像素，再向左移动2像素
-                    try {
-                        var boundingBox = button.boundingBox();
-                        if (boundingBox != null) {
-                            double centerX = boundingBox.x + boundingBox.width / 2;
-                            double centerY = boundingBox.y + boundingBox.height / 2;
-                            
-                            // 先移动到按钮中心
-                            page.mouse().move(centerX, centerY);
-                            Thread.sleep(50);
-                            
-                            // 向右移动2像素
-                            page.mouse().move(centerX + 2, centerY);
-                            Thread.sleep(50);
-                            
-                            // 向左移动2像素（回到中心再向左2像素）
-                            page.mouse().move(centerX - 2, centerY);
-                            Thread.sleep(50);
-                            
-                            // 回到中心位置
-                            page.mouse().move(centerX, centerY);
-                            Thread.sleep(50);
-                            
-                            log.debug("完成鼠标微调，准备点击按钮");
-                        }
-                    } catch (Exception moveError) {
-                        log.warn("鼠标微调失败，直接点击按钮: {}", moveError.getMessage());
-                    }
+                    // 已按要求禁用自动投递，改为在工作台手动投递
+                    log.info("已跳过自动投递(聊一聊): {} @ {}", jobName, companyName);
                     
-                    button.click();
-                    // PlaywrightUtil.sleep(1); // 等待点击响应
-                    
-                    // 猎聘会自动发送打招呼语，所以我们只需要关闭聊天窗口
-                    try {
-                        // 等待聊天界面加载
-                        page.waitForSelector(CHAT_HEADER, new Page.WaitForSelectorOptions().setTimeout(3000));
-                        
-                        // 直接关闭聊天窗口
-                        Locator close = page.locator(CHAT_CLOSE);
-                        if (close.count() > 0) {
-                            PlaywrightUtil.sleep(1);
-                            close.click();
-                        }
-                        
-                        resultList.add(sb.append("【").append(companyName).append(" ").append(jobName).append(" ").append(salary).append(" ").append(recruiterName).append(" ").append("】").toString());
-                        sb.setLength(0);
-                        // 点击成功后标记为已投递
-                        if (jobIdForUpdate != null) {
-                            liepinService.markDelivered(jobIdForUpdate);
-                        }
-                        
-                    } catch (Exception e) {
-                        log.warn("关闭聊天窗口失败，但投递可能已成功: {}", e.getMessage());
-                        // 即使关闭失败，也认为投递成功
-                        resultList.add(sb.append("【").append(companyName).append(" ").append(jobName).append(" ").append(salary).append(" ").append(recruiterName).append(" ").append("】").toString());
-                        sb.setLength(0);
-                        if (jobIdForUpdate != null) {
-                            liepinService.markDelivered(jobIdForUpdate);
-                        }
-                    }
-                    
+                    resultList.add(sb.append("【").append(companyName).append(" ").append(jobName).append(" ").append(salary).append(" ").append(recruiterName).append(" ").append("】").toString());
+                    sb.setLength(0);
                 } catch (Exception e) {
-                    log.error("点击按钮失败: {}", e.getMessage());
+                    log.error("模拟跳过失败: {}", e.getMessage());
                 }
             } else {
                 // 如果按钮是“继续聊”，视为已投递
@@ -587,7 +469,7 @@ public class Liepin {
         }
     }
 
-    // 从岗位卡片的 data 属性中提取 jobId（兼容 lastApiEntities 缺失场景）
+    // 从岗位卡片的 data 属性中提取 jobId（兼容接口数据缺失场景）
     private Long extractJobIdFromCard(Locator card) {
         try {
             String ext = card.getAttribute("data-tlg-ext");

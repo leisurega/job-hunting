@@ -82,4 +82,20 @@ public class BossJobDataEntity {
 
     @TableField("updated_at")
     private LocalDateTime updatedAt;
+
+    // --- AI 分析相关 (来自 job_workspace 表的关联数据) ---
+    @TableField(exist = false)
+    private String aiGap;
+
+    @TableField(exist = false)
+    private String aiPlan;
+
+    @TableField(exist = false)
+    private String analysisStatus;
+
+    @TableField(exist = false)
+    private Integer relevanceScore;
+
+    @TableField(exist = false)
+    private String relevanceReason;
 }

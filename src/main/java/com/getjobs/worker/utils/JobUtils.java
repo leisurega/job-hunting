@@ -72,6 +72,29 @@ public class JobUtils {
         return random.nextInt((max - min) + 1) + min;
     }
 
+    /**
+     * 计算字符串的 MD5 哈希值
+     * @param input 输入字符串
+     * @return 32 位 MD5 哈希值
+     */
+    public static String md5(String input) {
+        if (input == null) return null;
+        try {
+            java.security.MessageDigest md = java.security.MessageDigest.getInstance("MD5");
+            byte[] messageDigest = md.digest(input.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            StringBuilder hexString = new StringBuilder();
+            for (byte b : messageDigest) {
+                String hex = Integer.toHexString(0xff & b);
+                if (hex.length() == 1) hexString.append('0');
+                hexString.append(hex);
+            }
+            return hexString.toString();
+        } catch (java.security.NoSuchAlgorithmException e) {
+            log.error("MD5 calculation failed", e);
+            return String.valueOf(input.hashCode()); // 兜底返回 hashcode
+        }
+    }
+
     public static void main(String[] args) {
         Date star = new Date();
         PlaywrightUtil.sleep(3);

@@ -43,13 +43,12 @@ public class Job51 {
 
     private final List<String> resultList = new ArrayList<>();
     private final Job51Service job51Service;
-    private boolean networkHooked = false;
+    private final com.getjobs.application.service.JobWorkspaceService jobWorkspaceService;
+    private final com.getjobs.application.service.AiService aiService;
+    private final com.getjobs.worker.manager.PlaywrightManager playwrightManager;
     private boolean reachedDailyLimit = false;
-    private final java.util.Set<String> processedRequestIds = new java.util.HashSet<>();
     @Getter
     private int currentPageNum = 0;
-    // 当前页从JSON拦截到的jobId列表
-    private final java.util.List<Long> currentPageJobIds = new java.util.ArrayList<>();
 
     private static final int DEFAULT_MAX_PAGE = 50;
     private static final String BASE_URL = "https://we.51job.com/pc/search?";
@@ -120,71 +119,7 @@ public class Job51 {
     private void deliverByKeyword(String keyword, String searchUrl) {
         try {
             // 收敛日志：不输出关键词级日志，仅保留页级摘要
-
-            // 在跳转前监听 51job 搜索接口，抓取 JSON 并保存到数据库 + 打印诊断日志
-            if (!networkHooked) {
-                try {
-                    page.onResponse(r -> {
-                        try {
-                            String url = r.url();
-                            if (url != null && url.contains("/api/job/search-pc") && "GET".equalsIgnoreCase(r.request().method())) {
-                                int status = 0;
-                                try { status = r.status(); } catch (Throwable ignored) {}
-                                String text = null;
-                                try { text = r.text(); } catch (Throwable ignored) {}
-                                int len = text == null ? 0 : text.length();
-                                // 基于 URL 的 requestId 做去重，避免重复解析
-                                String requestId = null;
-                                try {
-                                    java.net.URI u = new java.net.URI(url);
-                                    String q = u.getQuery();
-                                    if (q != null) {
-                                        for (String part : q.split("&")) {
-                                            int i = part.indexOf('=');
-                                            if (i > 0 && "requestId".equals(part.substring(0, i))) {
-                                                requestId = java.net.URLDecoder.decode(part.substring(i + 1), java.nio.charset.StandardCharsets.UTF_8);
-                                                break;
-                                            }
-                                        }
-                                    }
-                                } catch (Exception ignored) {}
-                                if (requestId != null && !requestId.isBlank() && processedRequestIds.contains(requestId)) {
-                                    return;
-                                }
-                                if (text != null) {
-                                    // 根据 Content-Type 粗判是否为 JSON
-                                    boolean isJson = false;
-                                    try {
-                                        java.util.Map<String, String> headers = r.headers();
-                                        if (headers != null) {
-                                            String ct = headers.getOrDefault("content-type", headers.get("Content-Type"));
-                                            if (ct != null && ct.toLowerCase().contains("json")) isJson = true;
-                                        }
-                                    } catch (Throwable ignored) {}
-                                    if (isJson) {
-                                        // 解析并保存到数据库
-                                        job51Service.parseAndPersistJob51SearchJson(text);
-                                        // 📋 提取当前页的jobId列表并缓存
-                                        List<Long> jobIds = extractJobIdsFromJson(text);
-                                        if (jobIds != null && !jobIds.isEmpty()) {
-                                            synchronized (currentPageJobIds) {
-                                                currentPageJobIds.clear();
-                                                currentPageJobIds.addAll(jobIds);
-                                            }
-                                        }
-                                        if (requestId != null && !requestId.isBlank()) processedRequestIds.add(requestId);
-                                    } // 非JSON静默跳过
-                                }
-                            }
-                        } catch (Throwable e) {
-                            // 静默错误
-                        }
-                    });
-                    networkHooked = true;
-                } catch (Throwable e) {
-                    // 静默错误
-                }
-            }
+            // 响应拦截已由 PlaywrightManager 统一处理
 
             // 导航到搜索页面
             try {
@@ -272,41 +207,66 @@ public class Job51 {
 
             int jobCount = checkboxes.count();
 
-            // 选中所有职位
+            // 选中所有职位并分析
             for (int i = 0; i < jobCount; i++) {
                 if (shouldStop()) {
                     return;
                 }
 
                 try {
+                    String title = i < titles.count() ? titles.nth(i).textContent() : "未知职位";
+                    String company = i < companies.count() ? companies.nth(i).textContent() : "未知公司";
+                    
+                    // 获取详情链接并分析
+                    Locator titleLink = titles.nth(i).locator("a");
+                    String jobLink = titleLink.getAttribute("href");
+                    if (jobLink != null && !jobLink.isEmpty()) {
+                        Page detailPage = page.context().newPage();
+                        try {
+                            detailPage.navigate(jobLink, new Page.NavigateOptions().setTimeout(15000));
+                            // 51job JD 选择器
+                            detailPage.waitForSelector(".job-intro, .bmsg", new Page.WaitForSelectorOptions().setTimeout(10000));
+                            String jdText = detailPage.locator(".job-intro, .bmsg").innerText();
+                            
+                            // 提取 jobId
+                            Long jobId = parseJobIdFromHref(jobLink);
+                            
+                            // 同步到工作台
+                            jobWorkspaceService.processJob(
+                                "job51",
+                                String.valueOf(jobId),
+                                title,
+                                company,
+                                jdText,
+                                jobLink,
+                                "请查看详情", // 51 列表薪资解析稍后在服务层增强
+                                "请查看详情"
+                            );
+                        } catch (Exception e) {
+                            log.warn("获取 51job JD 详情失败: {} | {}", jobLink, e.getMessage());
+                        } finally {
+                            detailPage.close();
+                        }
+                    }
+
                     Locator checkbox = checkboxes.nth(i);
                     // 使用JavaScript点击，避免元素被遮挡
                     checkbox.evaluate("el => el.click()");
 
-                    String title = i < titles.count() ? titles.nth(i).textContent() : "未知职位";
-                    String company = i < companies.count() ? companies.nth(i).textContent() : "未知公司";
                     String jobInfo = company + " | " + title;
                     resultList.add(jobInfo);
-//                    log.info("选中: {}", jobInfo);
                 } catch (Exception e) { /* 静默 */ }
             }
 
             PlaywrightUtil.sleep(1);
 
-            // 滚动到页面顶部
-            page.evaluate("window.scrollTo(0, 0)");
-            PlaywrightUtil.sleep(1);
+            // 已按要求禁用自动批量投递，改为在工作台手动投递
+            log.info("[51job] 已完成当前页 {} 个职位的分析，跳过自动批量投递", jobCount);
+            sendProgress(String.format("已分析 %d 个职位，请在工作台查看并手动投递", jobCount), null, null);
 
-            // 点击批量投递按钮
-            clickBatchDeliverButton();
-
-            PlaywrightUtil.sleep(3);
-
-            // 处理投递成功弹窗
-            handleDeliverySuccessDialog();
-
-            // 处理单独投递申请弹窗
-            handleSeparateDeliveryDialog();
+            // 原有投递逻辑已禁用：
+            // clickBatchDeliverButton();
+            // ...
 
         } catch (Exception e) {
             log.error("投递当前页面失败", e);
@@ -396,10 +356,7 @@ public class Job51 {
                     // ✅ 投递成功后，标记数据库中的岗位为已投递
                     if (successNum != null && successNum > 0) {
                         try {
-                            List<Long> deliveredIds = new ArrayList<>();
-                            synchronized (currentPageJobIds) {
-                                deliveredIds.addAll(currentPageJobIds);
-                            }
+                            List<Long> deliveredIds = new ArrayList<>(playwrightManager.getLastJob51Ids());
                             if (!deliveredIds.isEmpty()) {
                                 // 只标记成功投递的数量（取成功数和缓存数的较小值）
                                 int markCount = Math.min(successNum, deliveredIds.size());
@@ -831,53 +788,5 @@ public class Job51 {
      */
     private boolean shouldStop() {
         return shouldStopCallback != null && shouldStopCallback.get();
-    }
-
-    /**
-     * 从JSON文本中提取jobId列表
-     */
-    private List<Long> extractJobIdsFromJson(String json) {
-        List<Long> jobIds = new ArrayList<>();
-        if (json == null || json.trim().isEmpty()) {
-            return jobIds;
-        }
-        
-        try {
-            com.fasterxml.jackson.databind.ObjectMapper mapper = new com.fasterxml.jackson.databind.ObjectMapper();
-            com.fasterxml.jackson.databind.JsonNode root = mapper.readTree(json);
-            
-            // 兼容多种列表命名
-            com.fasterxml.jackson.databind.JsonNode list = root.path("data").path("items");
-            if (!list.isArray()) list = root.path("data").path("jobList");
-            if (!list.isArray()) list = root.path("data").path("list");
-            if (!list.isArray()) list = root.path("data").path("jobs");
-            if (!list.isArray()) list = root.path("resultbody").path("job").path("items");
-            if (!list.isArray()) list = root.path("job").path("items");
-            if (!list.isArray()) list = root.path("resultbody").path("items");
-            
-            if (!list.isArray()) {
-                return jobIds;
-            }
-            
-            // 提取每个jobId
-            for (com.fasterxml.jackson.databind.JsonNode item : list) {
-                com.fasterxml.jackson.databind.JsonNode jobIdNode = item.path("jobId");
-                if (!jobIdNode.isMissingNode() && !jobIdNode.isNull()) {
-                    try {
-                        Long jobId = jobIdNode.asLong();
-                        if (jobId != null && jobId > 0) {
-                            jobIds.add(jobId);
-                        }
-                    } catch (Exception e) {
-                        // 忽略单个解析失败
-                    }
-                }
-            }
-            
-        } catch (Exception e) {
-            log.warn("[51job] 解析JSON提取jobId失败: {}", e.getMessage());
-        }
-        
-        return jobIds;
     }
 }

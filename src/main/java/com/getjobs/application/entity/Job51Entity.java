@@ -1,5 +1,6 @@
 package com.getjobs.application.entity;
 
+import com.baomidou.mybatisplus.annotation.TableField;
 import com.baomidou.mybatisplus.annotation.TableId;
 import com.baomidou.mybatisplus.annotation.TableName;
 import lombok.Data;
@@ -37,4 +38,16 @@ public class Job51Entity {
     private Integer delivered; // 0=未投递 1=已投递
     private String createTime;
     private String updateTime;
+
+    // --- AI 分析相关 (来自 job_workspace 表的关联数据) ---
+    @TableField(exist = false)
+    private String aiGap;
+    @TableField(exist = false)
+    private String aiPlan;
+    @TableField(exist = false)
+    private String analysisStatus;
+    @TableField(exist = false)
+    private Integer relevanceScore;
+    @TableField(exist = false)
+    private String relevanceReason;
 }

@@ -48,11 +48,11 @@ public class Boss {
     private BossConfig config;
     private final BossService bossService;
     private final AiService aiService;
+    private final com.getjobs.application.service.JobWorkspaceService jobWorkspaceService;
+    private final com.getjobs.worker.manager.PlaywrightManager playwrightManager;
     private Set<String> blackCompanies;
     private Set<String> blackRecruiters;
     private Set<String> blackJobs;
-    // 记录 encryptId -> encryptUserId 的映射，用于后续更新投递状态
-    private final ConcurrentMap<String, String> encryptIdToUserId = new ConcurrentHashMap<>();
     @Setter
     private ProgressCallback progressCallback;
     @Setter
@@ -389,8 +389,8 @@ public class Boss {
                 job.setJobInfo(jobDesc != null ? jobDesc : "");
 
                 // 输出
-                progressCallback.accept("正在投递：" + jobName, i + 1, count);
-                resumeSubmission(keyword, job);
+                progressCallback.accept("正在分析：" + jobName, i + 1, count);
+                // resumeSubmission(keyword, job); // 已按要求禁用自动投递，改为工作台手动分析后投递
                 postCount++;
 
                 // 为避免点击下面的卡片触发页面刷新：在点击5个卡片之后，每次点击后适度下滑
@@ -431,7 +431,7 @@ public class Boss {
                 }
             }
             if (encryptId != null && encryptUserId != null) {
-                encryptIdToUserId.put(encryptId, encryptUserId);
+                playwrightManager.getBossEncryptIdToUserId().put(encryptId, encryptUserId);
             }
 
             com.getjobs.application.entity.BossJobDataEntity entity = new com.getjobs.application.entity.BossJobDataEntity();
@@ -481,9 +481,21 @@ public class Boss {
 
             entity.setDeliveryStatus(filtered ? "已过滤" : "未投递");
 
-            // 入库（若不存在），优先以 encrypt_id + encrypt_user_id 去重；若 userId 缺失，则以 encrypt_id 去重
+            // 入库并同步到工作台
             if (encryptId != null) {
                 try {
+                    // 同步到统一分析工作台（全平台去重与分析）
+                    jobWorkspaceService.processJob(
+                        "boss",
+                        encryptId,
+                        entity.getJobName(),
+                        entity.getCompanyName(),
+                        entity.getJobDescription(),
+                        entity.getJobUrl(),
+                        entity.getSalary(),
+                        entity.getLocation()
+                    );
+
                     boolean exists = false;
                     if (encryptUserId != null) {
         exists = bossService.existsBossJob(encryptId, encryptUserId);
@@ -747,7 +759,7 @@ public class Boss {
         if (sendSuccess) {
             // 从详情链接提取 encrypt_id，并映射到 encrypt_user_id
             String encryptId = extractEncryptId(detailUrl);
-            String encryptUserId = encryptId != null ? encryptIdToUserId.get(encryptId) : null;
+            String encryptUserId = encryptId != null ? playwrightManager.getBossEncryptIdToUserId().get(encryptId) : null;
             if (encryptId != null && encryptUserId != null) {
                 try {
         bossService.updateDeliveryStatus(encryptId, encryptUserId, "已投递");
@@ -762,7 +774,7 @@ public class Boss {
         } else {
             // 若发生发送失败，也进行状态更新
             String encryptId = extractEncryptId(detailUrl);
-            String encryptUserId = encryptId != null ? encryptIdToUserId.get(encryptId) : null;
+            String encryptUserId = encryptId != null ? playwrightManager.getBossEncryptIdToUserId().get(encryptId) : null;
             if (encryptId != null && encryptUserId != null) {
                 try {
         bossService.updateDeliveryStatus(encryptId, encryptUserId, "投递失败");
@@ -775,48 +787,6 @@ public class Boss {
     }
 
     
-
-    /**
-     * 注册页面响应监听：拦截 /wapi/zpgeek/job/detail.json 请求并解析写库
-     */
-    private void attachJobDetailResponseListener() {
-        if (page == null) return;
-        page.onResponse(resp -> {
-            try {
-                String url = resp.url();
-                if (url == null) return;
-                // 仅处理 Boss 岗位详情接口（GET）
-                if (url.contains("/wapi/zpgeek/job/detail.json") &&
-                        "GET".equalsIgnoreCase(resp.request().method())) {
-                    String body = null;
-                    try {
-                        body = resp.text();
-                    } catch (Throwable ignore) {
-                        // 某些情况下可能拿不到文本，忽略
-                    }
-                    if (body == null || body.isEmpty()) return;
-
-                    // 保存原始 JSON 到 target/job.txt
-                    appendRawJson(body);
-
-                    // 仅记录映射与原始 JSON；入库逻辑已移动到点击卡片时
-                    JSONObject root = new JSONObject(body);
-                    JSONObject zpData = root.optJSONObject("zpData");
-                    if (zpData == null) return;
-                    JSONObject jobInfo = zpData.optJSONObject("jobInfo");
-                    if (jobInfo == null) return;
-                    String encryptId = jobInfo.optString("encryptId", null);
-                    String encryptUserId = jobInfo.optString("encryptUserId", null);
-                    if (encryptId != null && encryptUserId != null) {
-                        encryptIdToUserId.put(encryptId, encryptUserId);
-                    }
-                }
-            } catch (Throwable e) {
-                log.debug("监听岗位详情响应处理异常：{}", e.getMessage());
-            }
-        });
-    }
-
 
     /**
      * 追加保存原始 JSON 到 target/job.txt

@@ -1,6 +1,7 @@
 package com.getjobs.application.service;
 
 import com.getjobs.application.entity.AiEntity;
+import com.getjobs.application.entity.JobWorkspaceEntity;
 import com.getjobs.application.mapper.AiMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -315,6 +316,128 @@ public class AiService {
             return true;
         }
         return false;
+    }
+
+    /**
+     * 针对多条 JD 和个人介绍进行批量结构化分析
+     * @param jobs 岗位列表
+     * @return 包含分析结果的 JSON 数组字符串，格式：[{"id":1, "gap":"...", "plan":"..."}, ...]
+     */
+    public String analyzeGapAndPlanBatch(java.util.List<JobWorkspaceEntity> jobs) {
+        if (jobs == null || jobs.isEmpty()) return "[]";
+
+        AiEntity aiConfig = getAiConfig();
+        String introduce = (aiConfig != null && aiConfig.getIntroduce() != null) ? aiConfig.getIntroduce() : "";
+
+        StringBuilder jobsContent = new StringBuilder();
+        for (int i = 0; i < jobs.size(); i++) {
+            JobWorkspaceEntity job = jobs.get(i);
+            // 对 JD 进行截断，防止超出上下文
+            String jd = job.getJdText();
+            if (jd != null && jd.length() > 3000) {
+                jd = jd.substring(0, 3000) + "...(已截断)";
+            }
+            jobsContent.append(String.format("【岗位序号: %d, ID: %d】\n职位: %s @ %s\n描述: %s\n\n", 
+                i + 1, job.getId(), job.getJobName(), job.getCompanyName(), jd));
+        }
+
+        String batchPrompt = String.format(
+            "我的个人介绍如下：\n%s\n\n" +
+            "以下是 %d 个招聘岗位的描述 (JD)：\n%s\n" +
+            "请基于我的背景，分别为每个岗位分析【能力差距 (Gap)】并提出【提升计划 (Plan)】。\n" +
+            "要求：\n" +
+            "1. 必须返回一个纯 JSON 数组，不要包含任何说明文字。\n" +
+            "2. 数组中每个对象包含五个字段: \"id\" (岗位ID), \"gap\" (Gap分析文本), \"plan\" (提升计划文本), \"relevance_score\" (相关性打分，0-100), \"relevance_reason\" (打分理由)。\n" +
+            "3. 保持分析客观简洁。\n" +
+            "4. 必须按此 JSON 格式输出：[{\"id\": %d, \"gap\": \"...\", \"plan\": \"...\", \"relevance_score\": 85, \"relevance_reason\": \"...\"}, ...]",
+            introduce, jobs.size(), jobsContent.toString(), jobs.get(0).getId()
+        );
+
+        try {
+            // 这里可以根据模型是否支持 json_mode 调整，目前简单处理
+            String response = sendRequest(batchPrompt);
+            if (response == null || response.trim().isEmpty()) {
+                log.error("批量 AI 分析返回为空");
+                return "[]";
+            }
+
+            // 简单清洗：去掉可能存在的 markdown 代码块包裹
+            String jsonStr = response.trim();
+            if (jsonStr.startsWith("```json")) {
+                jsonStr = jsonStr.substring(7);
+            } else if (jsonStr.startsWith("```")) {
+                jsonStr = jsonStr.substring(3);
+            }
+            if (jsonStr.endsWith("```")) {
+                jsonStr = jsonStr.substring(0, jsonStr.length() - 3);
+            }
+            jsonStr = jsonStr.trim();
+
+            // 尝试校验是否为合法 JSON 数组
+            new JSONArray(jsonStr); 
+            return jsonStr;
+        } catch (Exception e) {
+            log.error("批量 AI 分析异常", e);
+            return "[]";
+        }
+    }
+
+    /**
+     * 针对 JD 和个人介绍分析差距及提升计划
+     * @param jd Job Description
+     * @return String 数组，[0] 为 Gap, [1] 为 Plan
+     */
+    public String[] analyzeGapAndPlan(String jd) {
+        AiEntity aiConfig = getAiConfig();
+        String introduce = (aiConfig != null && aiConfig.getIntroduce() != null) ? aiConfig.getIntroduce() : "";
+
+        // 构造提示词。要求 AI 按特定格式输出以便解析。
+        String userPrompt = String.format(
+            "我的个人介绍如下：\n%s\n\n" +
+            "现在的招聘岗位描述 (JD) 如下：\n%s\n\n" +
+            "请基于以上内容，分析我的【能力差距 (Gap)】并提出【提升计划 (Plan)】，同时给出【相关性打分】(0-100) 及【打分理由】。\n" +
+            "回复格式必须严格遵守：\n" +
+            "【Gap分析】: ...\n" +
+            "【提升计划】: ...\n" +
+            "【相关性打分】: ...\n" +
+            "【打分理由】: ...\n" +
+            "请直接输出分析结果，不要包含任何前言、后记或说明性文字。",
+            introduce, jd
+        );
+
+        try {
+            String response = sendRequest(userPrompt);
+            if (response == null || response.trim().isEmpty()) {
+                return new String[]{"AI 分析失败", "AI 分析失败"};
+            }
+
+            String gap = "未解析到 Gap 分析";
+            String plan = "未解析到提升计划";
+
+            // 解析逻辑，适配多种冒号
+            String markerGap = "【Gap分析】";
+            String markerPlan = "【提升计划】";
+            int gapIdx = response.indexOf(markerGap);
+            int planIdx = response.indexOf(markerPlan);
+
+            if (gapIdx != -1 && planIdx != -1) {
+                if (gapIdx < planIdx) {
+                    gap = response.substring(gapIdx + markerGap.length(), planIdx).trim().replaceAll("^[:：\\s]+", "");
+                    plan = response.substring(planIdx + markerPlan.length()).trim().replaceAll("^[:：\\s]+", "");
+                } else {
+                    plan = response.substring(planIdx + markerPlan.length(), gapIdx).trim().replaceAll("^[:：\\s]+", "");
+                    gap = response.substring(gapIdx + markerGap.length()).trim().replaceAll("^[:：\\s]+", "");
+                }
+            } else {
+                gap = response;
+                plan = "AI 返回格式非预期，请查看 Gap 分析全文。";
+            }
+
+            return new String[]{gap, plan};
+        } catch (Exception e) {
+            log.error("AI 分析异常", e);
+            return new String[]{"分析异常: " + e.getMessage(), "请检查网络或配置"};
+        }
     }
 
     /**

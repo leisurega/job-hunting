@@ -1,5 +1,6 @@
 package com.getjobs.application.entity;
 
+import com.baomidou.mybatisplus.annotation.TableField;
 import com.baomidou.mybatisplus.annotation.TableId;
 import com.baomidou.mybatisplus.annotation.TableName;
 import lombok.Data;
@@ -43,4 +44,16 @@ public class LiepinEntity {
     // ========== 系统字段 ==========
     private LocalDateTime createTime;
     private LocalDateTime updateTime;
+
+    // --- AI 分析相关 (来自 job_workspace 表的关联数据) ---
+    @TableField(exist = false)
+    private String aiGap;
+    @TableField(exist = false)
+    private String aiPlan;
+    @TableField(exist = false)
+    private String analysisStatus;
+    @TableField(exist = false)
+    private Integer relevanceScore;
+    @TableField(exist = false)
+    private String relevanceReason;
 }

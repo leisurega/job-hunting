@@ -10,13 +10,16 @@ import com.getjobs.application.entity.BossOptionEntity;
 import com.getjobs.application.mapper.BlacklistMapper;
 import com.getjobs.application.mapper.BossJobDataMapper;
 import com.getjobs.application.entity.BossJobDataEntity;
+import com.getjobs.application.entity.JobWorkspaceEntity;
 import com.getjobs.application.mapper.BossConfigMapper;
 import com.getjobs.application.mapper.BossIndustryMapper;
 import com.getjobs.application.mapper.BossOptionMapper;
+import com.getjobs.application.mapper.JobWorkspaceMapper;
 import com.getjobs.worker.boss.BossConfig;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.sql.Connection;
 import java.sql.ResultSet;
@@ -47,6 +50,7 @@ public class BossService {
     private final BossConfigMapper bossConfigMapper;
     private final BlacklistMapper blacklistMapper;
     private final BossJobDataMapper bossJobDataMapper;
+    private final JobWorkspaceMapper jobWorkspaceMapper;
     private final javax.sql.DataSource dataSource;
 
     // ==================== Option相关方法 ====================
@@ -627,6 +631,37 @@ public class BossService {
         bossJobDataMapper.update(update, uw);
     }
 
+    /**
+     * 删除岗位记录
+     */
+    @Transactional
+    public boolean deleteBossJob(String encryptId) {
+        // 级联删除 job_workspace
+        LambdaQueryWrapper<JobWorkspaceEntity> jw = new LambdaQueryWrapper<>();
+        jw.eq(JobWorkspaceEntity::getPlatform, "boss").eq(JobWorkspaceEntity::getExternalId, encryptId);
+        jobWorkspaceMapper.delete(jw);
+
+        QueryWrapper<BossJobDataEntity> wrapper = new QueryWrapper<>();
+        wrapper.eq("encrypt_id", encryptId);
+        return bossJobDataMapper.delete(wrapper) > 0;
+    }
+
+    /**
+     * 批量删除岗位记录
+     */
+    @Transactional
+    public boolean deleteBossJobs(List<String> encryptIds) {
+        if (encryptIds == null || encryptIds.isEmpty()) return true;
+        
+        LambdaQueryWrapper<JobWorkspaceEntity> jw = new LambdaQueryWrapper<>();
+        jw.eq(JobWorkspaceEntity::getPlatform, "boss").in(JobWorkspaceEntity::getExternalId, encryptIds);
+        jobWorkspaceMapper.delete(jw);
+
+        QueryWrapper<BossJobDataEntity> wrapper = new QueryWrapper<>();
+        wrapper.in("encrypt_id", encryptIds);
+        return bossJobDataMapper.delete(wrapper) > 0;
+    }
+
     // ==================== 投递分析（Dashboard）相关方法 ====================
 
     /**
@@ -1101,6 +1136,28 @@ public class BossService {
         int from = Math.max(0, (page - 1) * size);
         int to = Math.min(total, from + size);
         List<BossJobDataEntity> pageItems = from >= to ? Collections.emptyList() : filtered.subList(from, to);
+
+        // 关联 AI 分析结果
+        if (!pageItems.isEmpty()) {
+            List<String> extIds = pageItems.stream().map(BossJobDataEntity::getEncryptId).collect(Collectors.toList());
+            LambdaQueryWrapper<JobWorkspaceEntity> workspaceWrapper = new LambdaQueryWrapper<>();
+            workspaceWrapper.eq(JobWorkspaceEntity::getPlatform, "boss")
+                            .in(JobWorkspaceEntity::getExternalId, extIds);
+            List<JobWorkspaceEntity> analysisList = jobWorkspaceMapper.selectList(workspaceWrapper);
+            Map<String, JobWorkspaceEntity> analysisMap = analysisList.stream()
+                    .collect(Collectors.toMap(JobWorkspaceEntity::getExternalId, a -> a, (a1, a2) -> a1));
+            
+            for (BossJobDataEntity item : pageItems) {
+                JobWorkspaceEntity analysis = analysisMap.get(item.getEncryptId());
+                if (analysis != null) {
+                    item.setAiGap(analysis.getAiGap());
+                    item.setAiPlan(analysis.getAiPlan());
+                    item.setAnalysisStatus(analysis.getAnalysisStatus());
+                    item.setRelevanceScore(analysis.getRelevanceScore());
+                    item.setRelevanceReason(analysis.getRelevanceReason());
+                }
+            }
+        }
 
         PagedResult result = new PagedResult();
         result.items = pageItems;

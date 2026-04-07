@@ -1,15 +1,19 @@
 package com.getjobs.application.service;
 
+import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
 import com.getjobs.application.entity.LiepinEntity;
 import com.getjobs.application.entity.LiepinConfigEntity;
 import com.getjobs.application.entity.LiepinOptionEntity;
+import com.getjobs.application.entity.JobWorkspaceEntity;
 import com.getjobs.application.mapper.LiepinConfigMapper;
 import com.getjobs.application.mapper.LiepinOptionMapper;
 import com.getjobs.application.mapper.LiepinMapper;
+import com.getjobs.application.mapper.JobWorkspaceMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
 import java.util.*;
@@ -35,6 +39,7 @@ public class LiepinService {
     private final LiepinOptionMapper liepinOptionMapper;
     // 记录持久化相关依赖（整合自 LiepinRecordService）
     private final LiepinMapper liepinMapper;
+    private final JobWorkspaceMapper jobWorkspaceMapper;
     private final DataSource dataSource;
 
     // ==================== 记录表初始化与快照保存 ====================
@@ -353,6 +358,34 @@ public class LiepinService {
         return cityCodeOrName;
     }
 
+    /**
+     * 删除岗位记录
+     */
+    @Transactional
+    public boolean delete(Long jobId) {
+        // 级联删除 job_workspace
+        LambdaQueryWrapper<JobWorkspaceEntity> jw = new LambdaQueryWrapper<>();
+        jw.eq(JobWorkspaceEntity::getPlatform, "liepin").eq(JobWorkspaceEntity::getExternalId, String.valueOf(jobId));
+        jobWorkspaceMapper.delete(jw);
+
+        return liepinMapper.deleteById(jobId) > 0;
+    }
+
+    /**
+     * 批量删除岗位记录
+     */
+    @Transactional
+    public boolean deleteBatch(List<Long> jobIds) {
+        if (jobIds == null || jobIds.isEmpty()) return true;
+
+        List<String> extIds = jobIds.stream().map(String::valueOf).collect(Collectors.toList());
+        LambdaQueryWrapper<JobWorkspaceEntity> jw = new LambdaQueryWrapper<>();
+        jw.eq(JobWorkspaceEntity::getPlatform, "liepin").in(JobWorkspaceEntity::getExternalId, extIds);
+        jobWorkspaceMapper.delete(jw);
+
+        return liepinMapper.deleteBatchIds(jobIds) > 0;
+    }
+
     // ==================== 分析与列表（参考 BossService） ====================
 
     public static class SalaryInfo {
@@ -666,7 +699,31 @@ public class LiepinService {
         int to = Math.min(total, from + size);
 
         PagedResult pr = new PagedResult();
-        pr.items = filtered.subList(from, to);
+        List<LiepinEntity> pageItems = filtered.subList(from, to);
+        
+        // 关联 AI 分析结果
+        if (!pageItems.isEmpty()) {
+            List<String> extIds = pageItems.stream().map(it -> String.valueOf(it.getJobId())).collect(Collectors.toList());
+            LambdaQueryWrapper<JobWorkspaceEntity> workspaceWrapper = new LambdaQueryWrapper<>();
+            workspaceWrapper.eq(JobWorkspaceEntity::getPlatform, "liepin")
+                            .in(JobWorkspaceEntity::getExternalId, extIds);
+            List<JobWorkspaceEntity> analysisList = jobWorkspaceMapper.selectList(workspaceWrapper);
+            Map<String, JobWorkspaceEntity> analysisMap = analysisList.stream()
+                    .collect(Collectors.toMap(JobWorkspaceEntity::getExternalId, a -> a, (a1, a2) -> a1));
+            
+            for (LiepinEntity item : pageItems) {
+                JobWorkspaceEntity analysis = analysisMap.get(String.valueOf(item.getJobId()));
+                if (analysis != null) {
+                    item.setAiGap(analysis.getAiGap());
+                    item.setAiPlan(analysis.getAiPlan());
+                    item.setAnalysisStatus(analysis.getAnalysisStatus());
+                    item.setRelevanceScore(analysis.getRelevanceScore());
+                    item.setRelevanceReason(analysis.getRelevanceReason());
+                }
+            }
+        }
+
+        pr.items = pageItems;
         pr.total = total;
         pr.page = page;
         pr.size = size;

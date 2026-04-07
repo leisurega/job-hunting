@@ -33,7 +33,8 @@ import java.util.concurrent.CopyOnWriteArrayList;
 public class BossController {
     private static final ObjectMapper objectMapper = new ObjectMapper();
 
-    private final BossJobService bossJobService;
+    private final com.getjobs.application.service.BossService bossService;
+    private final com.getjobs.worker.service.BossJobService bossJobService;
     private final PlaywrightManager playwrightManager;
     private final CookieService cookieService;
 
@@ -169,6 +170,18 @@ public class BossController {
     @GetMapping("/status")
     public ResponseEntity<Map<String, Object>> getBossStatus() {
         return ResponseEntity.ok(bossJobService.getStatus());
+    }
+
+    /** 删除岗位记录 */
+    @DeleteMapping("/{encryptId}")
+    public boolean delete(@PathVariable String encryptId) {
+        return bossService.deleteBossJob(encryptId);
+    }
+
+    /** 批量删除岗位记录 */
+    @PostMapping("/batch-delete")
+    public boolean batchDelete(@RequestBody List<String> encryptIds) {
+        return bossService.deleteBossJobs(encryptIds);
     }
 
     private void sendBossProgress(JobProgressMessage message) {
