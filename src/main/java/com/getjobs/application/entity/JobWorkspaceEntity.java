@@ -79,4 +79,16 @@ public class JobWorkspaceEntity {
 
     @TableField("relevance_reason")
     private String relevanceReason; // 打分理由
+
+    @TableField(exist = false)
+    private String industry; // 平台快照中的行业
+
+    @TableField(exist = false)
+    private String experience; // 平台快照中的经验要求
+
+    @TableField(exist = false)
+    private String degree; // 平台快照中的学历要求
+
+    @TableField(exist = false)
+    private String sourceDeliveryStatus; // 平台快照中的投递状态文案
 }

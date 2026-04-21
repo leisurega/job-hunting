@@ -85,7 +85,44 @@ public class BossController {
         ));
     }
 
-    /** POST - 启动Boss投递任务（前端使用的接口）*/
+    /** POST - 启动Boss抓取任务 */
+    @PostMapping("/crawl")
+    public ResponseEntity<Map<String, Object>> crawlBoss() {
+        Map<String, Object> response = new HashMap<>();
+        try {
+            if (!playwrightManager.isLoggedIn("boss")) {
+                response.put("success", false);
+                response.put("message", "请先登录Boss直聘");
+                response.put("status", "not_logged_in");
+                response.put("needLogin", true);
+                return ResponseEntity.ok(response); // 改为 200，让前端能正常解析 needLogin
+            }
+            if (bossJobService.isRunning()) {
+                response.put("success", false);
+                response.put("message", "Boss任务已在运行中，请等待当前任务完成");
+                response.put("status", "running");
+                return ResponseEntity.badRequest().body(response);
+            }
+            CompletableFuture.runAsync(() -> bossJobService.executeCrawl(pm -> {
+                sendBossProgress(pm);
+                log.info("[{}] {}", pm.getPlatform(), pm.getMessage());
+            }));
+            response.put("success", true);
+            response.put("message", "Boss抓取任务启动成功");
+            response.put("status", "started");
+            return ResponseEntity.ok(response);
+        } catch (Exception e) {
+            log.error("启动Boss抓取任务失败", e);
+            response.put("success", false);
+            response.put("message", "启动Boss抓取任务失败: " + e.getMessage());
+            return ResponseEntity.internalServerError().body(response);
+        }
+    }
+
+    /** POST - 启动Boss投递任务（前端使用的接口）
+     * @deprecated 请使用 /crawl 仅抓取，或在工作台执行投递
+     */
+    @Deprecated
     @PostMapping("/start")
     public ResponseEntity<Map<String, Object>> startBoss() {
         Map<String, Object> response = new HashMap<>();
@@ -206,7 +243,7 @@ public class BossController {
     }
 
     /** 心跳 - Boss进度 SSE */
-    @Scheduled(fixedRate = 30000)
+    @Scheduled(fixedRate = 300000) // 延长到5分钟一次
     public void heartbeatBossProgress() {
         if (bossProgressEmitters.isEmpty()) return;
         List<SseEmitter> deadEmitters = new CopyOnWriteArrayList<>();

@@ -28,6 +28,11 @@ public class ZhilianConfig {
      */
     private String salary;
 
+    /**
+     * 每次抓取最大条数
+     */
+    private Integer maxItems;
+
 
     // 注意：已改为在 ZhilianJobService 中通过 ConfigService 构建配置
     // 保留空的 init 以兼容旧调用，但建议不要再使用

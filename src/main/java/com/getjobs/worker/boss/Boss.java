@@ -9,6 +9,7 @@ import com.getjobs.worker.utils.PlaywrightUtil;
 import com.microsoft.playwright.Locator;
 import com.microsoft.playwright.Page;
 import com.microsoft.playwright.Response;
+import lombok.Getter;
 import lombok.RequiredArgsConstructor;
 import lombok.Setter;
 import lombok.SneakyThrows;
@@ -59,6 +60,19 @@ public class Boss {
     private Supplier<Boolean> shouldStopCallback;
 
     private final List<Job> resultList = new ArrayList<>();
+    @Setter
+    private boolean fetchOnly = false;
+    @Setter
+    private Set<String> targetIds = Collections.emptySet();
+    @Setter
+    private int maxInitialItems = 30;
+    @Getter
+    private int scannedCount = 0;
+
+    /**
+     * 停止标志
+     */
+    private volatile boolean cancelled = false;
 
     /**
      * 进度回调接口
@@ -71,6 +85,8 @@ public class Boss {
     // 通过 Lombok @RequiredArgsConstructor 使用构造器注入 bossService 与 aiService
 
     public void prepare() {
+        scannedCount = 0;
+        cancelled = false;
         // 调整 boss_data 表结构：将 encrypt_id、encrypt_user_id 前置
         try { bossService.ensureBossDataColumnOrder(); } catch (Throwable ignore) {}
         // 从数据库加载黑名单
@@ -83,6 +99,14 @@ public class Boss {
                 blackRecruiters != null ? blackRecruiters.size() : 0,
                 blackJobs != null ? blackJobs.size() : 0);
         // 不在页面初始化阶段入库，仅用于后续点击卡片时按需入库
+    }
+
+    /**
+     * 执行抓取任务
+     */
+    public int crawl() {
+        this.fetchOnly = true;
+        return execute();
     }
 
     /**
@@ -204,12 +228,21 @@ public class Boss {
         return result;
     }
 
+    // ========== 停止状态检查 ==========
+    private boolean shouldStop() {
+        return cancelled || (shouldStopCallback != null && Boolean.TRUE.equals(shouldStopCallback.get()));
+    }
+
+    public void cancel() {
+        this.cancelled = true;
+    }
+
     private void postJobByCity(String cityCode) {
         String searchUrl = getSearchUrl(cityCode);
         for (String keyword : config.getKeywords()) {
             // 检查是否需要停止
-            if (shouldStopCallback.get()) {
-                progressCallback.accept("用户取消投递", 0, 0);
+            if (shouldStop()) {
+                progressCallback.accept("任务已取消", 0, 0);
                 return;
             }
 
@@ -224,35 +257,33 @@ public class Boss {
             // 等待列表容器出现，确保页面完成首屏渲染
             page.waitForSelector("//ul[contains(@class, 'rec-job-list')]", new Page.WaitForSelectorOptions().setTimeout(60_000));
 
-            // 1. 基于 footer 出现滚动到底，确保加载全部岗位
-            int lastCount = -1;
-            int stableTries = 0;
-            for (int i = 0; i < 5000; i++) { // 最多尝试约120次，避免死循环
-                // 停止检查：滚动加载过程中也要及时响应
-                if (shouldStopCallback != null && Boolean.TRUE.equals(shouldStopCallback.get())) {
-                    progressCallback.accept("用户取消投递", 0, 0);
-                    return;
-                }
-                Locator footer = page.locator("div#footer, #footer");
-                if (footer.count() > 0 && footer.first().isVisible()) {
-                    break; // 到达页面底部
-                }
-                // 按视口高度的90%渐进滚动，触发懒加载
-                page.evaluate("() => window.scrollBy(0, Math.floor(window.innerHeight * 1.5))");
+            if (!fetchOnly) {
+                // 1. 基于 footer 出现滚动到底，确保加载全部岗位
+                int lastCount = -1;
+                int stableTries = 0;
+                for (int i = 0; i < 5000; i++) { // 最多尝试约120次，避免死循环
+                    if (shouldStop()) {
+                        progressCallback.accept("任务已取消", 0, 0);
+                        return;
+                    }
+                    Locator footer = page.locator("div#footer, #footer");
+                    if (footer.count() > 0 && footer.first().isVisible()) {
+                        break;
+                    }
+                    page.evaluate("() => window.scrollBy(0, Math.floor(window.innerHeight * 1.5))");
 
-                // 获取卡片数量变化，判断是否需要强制触底
-                Locator cardsProbe = page.locator("//ul[contains(@class, 'rec-job-list')]//li[contains(@class, 'job-card-box')]");
-                int currentCount = cardsProbe.count();
-                if (currentCount == lastCount) {
-                    stableTries++;
-                } else {
-                    stableTries = 0;
-                }
-                lastCount = currentCount;
+                    Locator cardsProbe = page.locator("//ul[contains(@class, 'rec-job-list')]//li[contains(@class, 'job-card-box')]");
+                    int currentCount = cardsProbe.count();
+                    if (currentCount == lastCount) {
+                        stableTries++;
+                    } else {
+                        stableTries = 0;
+                    }
+                    lastCount = currentCount;
 
-                if (stableTries >= 3) { // 连续多次无新增，则强制触底一次
-                    page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)");
-                    // 触底不再等待，继续检测 footer 出现
+                    if (stableTries >= 3) {
+                        page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)");
+                    }
                 }
             }
             // 统计最终岗位数量
@@ -268,11 +299,20 @@ public class Boss {
             // 3. 逐个遍历所有岗位
             Locator cards = page.locator("//ul[contains(@class, 'rec-job-list')]//li[contains(@class, 'job-card-box')]");
             int count = cards.count();
+            if (fetchOnly && maxInitialItems > 0 && count > maxInitialItems) {
+                count = maxInitialItems;
+            }
             for (int i = 0; i < count; i++) {
                 // 检查是否需要停止
-                if (shouldStopCallback != null && Boolean.TRUE.equals(shouldStopCallback.get())) {
-                    progressCallback.accept("用户取消投递", i, count);
+                if (shouldStop()) {
+                    progressCallback.accept("任务已取消", i, count);
                     return;
+                }
+
+                // 安全调整：fetchOnly 模式下不再逐个点击卡片获取详情，避免风控
+                if (fetchOnly) {
+                    scannedCount++;
+                    continue; 
                 }
 
                 // 重新获取卡片，避免元素过期
@@ -306,6 +346,7 @@ public class Boss {
                 PlaywrightUtil.sleep(1);
 
                 // 统一从请求返回的 JSON 中获取数据并做过滤
+                String encryptId = null;
                 String jobName = null;
                 String jobSalary = null;
                 java.util.List<String> tags = new java.util.ArrayList<>();
@@ -331,6 +372,7 @@ public class Boss {
                         org.json.JSONObject boss = zpData != null ? zpData.optJSONObject("bossInfo") : null;
 
                         if (jobInfo != null) {
+                            encryptId = jobInfo.optString("encryptId", "");
                             jobName = jobInfo.optString("jobName", "");
                             jobSalary = jobInfo.optString("salaryDesc", "");
                             String city = jobInfo.optString("locationName", "");
@@ -387,10 +429,18 @@ public class Boss {
                 job.setCompanyName(bossCompany != null ? bossCompany : "");
                 job.setRecruiter(bossName != null ? bossName : "");
                 job.setJobInfo(jobDesc != null ? jobDesc : "");
+                scannedCount++;
+
+                boolean targeted = targetIds != null && !targetIds.isEmpty();
+                if (targeted && (encryptId == null || encryptId.isEmpty() || !targetIds.contains(encryptId))) {
+                    continue;
+                }
 
                 // 输出
                 progressCallback.accept("正在分析：" + jobName, i + 1, count);
-                // resumeSubmission(keyword, job); // 已按要求禁用自动投递，改为工作台手动分析后投递
+                if (targeted) {
+                    resumeSubmission(keyword, job);
+                }
                 postCount++;
 
                 // 为避免点击下面的卡片触发页面刷新：在点击5个卡片之后，每次点击后适度下滑

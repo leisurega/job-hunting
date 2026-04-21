@@ -23,6 +23,9 @@ public class Job51ConfigEntity {
     /** 薪资范围（中文名或代码，列表字符串） */
     private String salary;
 
+    /** 每次抓取最大条数 */
+    private Integer maxItems;
+
     /** 创建时间 */
     private LocalDateTime createdAt;
 

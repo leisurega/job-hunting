@@ -23,6 +23,9 @@ public class LiepinConfigEntity {
     /** 薪资代码或范围 */
     private String salaryCode;
 
+    /** 每次抓取最大条数 */
+    private Integer maxItems;
+
     /** 创建时间 */
     private LocalDateTime createdAt;
 

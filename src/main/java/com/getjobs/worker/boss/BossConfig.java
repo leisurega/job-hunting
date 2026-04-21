@@ -103,4 +103,9 @@ public class BossConfig {
      * HR未上线状态
      */
     private List<String> deadStatus;
+
+    /**
+     * 每次抓取最大条数
+     */
+    private Integer maxItems;
 }

@@ -49,6 +49,8 @@ public class BossConfigEntity {
     private Integer filterDeadHr;
     /** HR不在线状态列表（逗号或括号列表） */
     private String deadStatus;
+    /** 每次抓取最大条数 */
+    private Integer maxItems;
     /** 创建时间 */
     private LocalDateTime createdAt;
     /** 更新时间 */

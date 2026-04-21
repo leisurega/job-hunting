@@ -262,10 +262,45 @@ public class ZhilianController {
 
     // ==================== 任务管理相关接口 ====================
 
+    /** POST - 启动智联抓取任务 */
+    @PostMapping("/crawl")
+    public ResponseEntity<Map<String, Object>> crawlZhilian() {
+        Map<String, Object> response = new HashMap<>();
+        try {
+            if (!playwrightManager.isLoggedIn("zhilian")) {
+                response.put("success", false);
+                response.put("message", "请先登录智联招聘");
+                response.put("status", "not_logged_in");
+                response.put("needLogin", true);
+                return ResponseEntity.ok(response);
+            }
+            if (zhilianJobService.isRunning()) {
+                response.put("success", false);
+                response.put("message", "智联招聘任务已在运行中，请等待当前任务完成");
+                response.put("status", "running");
+                return ResponseEntity.badRequest().body(response);
+            }
+            CompletableFuture.runAsync(() -> zhilianJobService.executeCrawl(pm -> {
+                log.info("[{}] {}", pm.getPlatform(), pm.getMessage());
+            }));
+            response.put("success", true);
+            response.put("message", "智联招聘抓取任务启动成功");
+            response.put("status", "started");
+            return ResponseEntity.ok(response);
+        } catch (Exception e) {
+            log.error("启动智联招聘抓取任务失败", e);
+            response.put("success", false);
+            response.put("message", "启动智联招聘抓取任务失败: " + e.getMessage());
+            return ResponseEntity.internalServerError().body(response);
+        }
+    }
+
     /**
      * 启动智联招聘自动投递任务
      * @return 响应结果
+     * @deprecated 请使用 /crawl 仅抓取，或在工作台执行投递
      */
+    @Deprecated
     @PostMapping("/start")
     public ResponseEntity<Map<String, Object>> startZhilianJob() {
         Map<String, Object> response = new HashMap<>();

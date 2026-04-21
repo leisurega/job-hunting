@@ -18,8 +18,10 @@ import org.springframework.beans.factory.annotation.Autowired;
 
 // 移除保存页面源码相关的导入
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Date;
 import java.util.List;
+import java.util.Set;
 import java.util.function.Supplier;
 
 import static com.getjobs.worker.liepin.Locators.*;
@@ -42,7 +44,23 @@ public class Liepin {
     private final List<String> resultList = new ArrayList<>();
     private boolean monitoringRegistered = false;
     @Setter
+    private boolean fetchOnly = false;
+    @Setter
+    private Set<Long> targetJobIds = Collections.emptySet();
+    @Setter
+    private int maxPageLimit = 50;
+    @Setter
+    private int maxInitialItems = 30;
+    @Getter
+    private int scannedCount = 0;
+    @Setter
     private LiepinConfig config;
+
+    /**
+     * 停止标志
+     */
+    private volatile boolean cancelled = false;
+
     @Getter
     private Date startDate;
     @Setter
@@ -68,7 +86,17 @@ public class Liepin {
     public void prepare() {
         this.startDate = new Date();
         this.resultList.clear();
+        this.scannedCount = 0;
+        this.cancelled = false;
         // 监控由 PlaywrightManager 统一注册，此处不再重复
+    }
+
+    /**
+     * 执行抓取任务
+     */
+    public int crawl() {
+        this.fetchOnly = true;
+        return execute();
     }
 
     public int execute() {
@@ -105,7 +133,11 @@ public class Liepin {
 
     // ========== 停止状态检查 ==========
     private boolean shouldStop() {
-        return shouldStopCallback != null && Boolean.TRUE.equals(shouldStopCallback.get());
+        return cancelled || (shouldStopCallback != null && Boolean.TRUE.equals(shouldStopCallback.get()));
+    }
+
+    public void cancel() {
+        this.cancelled = true;
     }
 
     private void info(String msg) {
@@ -119,7 +151,8 @@ public class Liepin {
     private void submit(String keyword) {
         // 清洗关键词：去掉前后引号与多余空白
         String cleanKeyword = keyword == null ? "" : keyword.replace("\"", "").trim();
-        String searchUrl = getSearchUrl() + "&key=" + cleanKeyword;
+        String encodedKeyword = java.net.URLEncoder.encode(cleanKeyword, java.nio.charset.StandardCharsets.UTF_8);
+        String searchUrl = getSearchUrl() + "&key=" + encodedKeyword;
         
         // 导航带重试机制，应对 Playwright 并发导致的 Object doesn't exist 异常
         int maxRetries = 3;
@@ -135,10 +168,26 @@ public class Liepin {
         }
         
         // 等待分页元素加载
-        page.waitForSelector(PAGINATION_BOX, new Page.WaitForSelectorOptions().setTimeout(10000));
+        try {
+            page.waitForSelector(PAGINATION_BOX, new Page.WaitForSelectorOptions().setTimeout(10000));
+        } catch (com.microsoft.playwright.TimeoutError te) {
+            String currentUrl = page.url();
+            String title = page.title();
+            log.warn("猎聘分页等待超时 keyword={}, url={}, title={}", cleanKeyword, currentUrl, title);
+            if (currentUrl.contains("safe.liepin.com") || currentUrl.contains("captcha") || title.contains("验证码")) {
+                throw new IllegalStateException("NEED_CAPTCHA: 触发猎聘安全验证，请在 Playwright 窗口完成验证后重试");
+            }
+            if (currentUrl.contains("login") || title.contains("登录")) {
+                throw new IllegalStateException("NEED_LOGIN: 会话失效，请在 Playwright 窗口重新登录猎聘");
+            }
+            throw new IllegalStateException("PAGE_NO_RESULTS: 搜索 '" + cleanKeyword + "' 未返回分页，可能是关键词过窄或页面改版");
+        }
         Locator paginationBox = page.locator(PAGINATION_BOX);
         Locator lis = paginationBox.locator("li");
         setMaxPage(lis);
+        if (maxPageLimit > 0 && maxPage > maxPageLimit) {
+            maxPage = maxPageLimit;
+        }
         
         for (int i = 0; i < maxPage; i++) {
             if (shouldStop()) {
@@ -261,32 +310,17 @@ public class Liepin {
                 if (i < entities.size()) {
                     LiepinEntity apiEntity = entities.get(i);
                     String jobLink = apiEntity.getJobLink();
-                    if (jobLink != null && !jobLink.isEmpty()) {
-                        // 打开详情页获取 JD
-                        Page detailPage = page.context().newPage();
-                        try {
-                            detailPage.navigate(jobLink, new Page.NavigateOptions().setTimeout(15000));
-                            // 等待 JD 文本容器，猎聘常见 JD 选择器
-                            detailPage.waitForSelector(".job-description-box, .job-intro-container, .post-jd", new Page.WaitForSelectorOptions().setTimeout(10000));
-                            String jdText = detailPage.locator(".job-description-box, .job-intro-container, .post-jd").innerText();
-                            
-                            // 同步到工作台
-                            jobWorkspaceService.processJob(
-                                "liepin",
-                                String.valueOf(apiEntity.getJobId()),
-                                apiEntity.getJobTitle(),
-                                apiEntity.getCompName(),
-                                jdText,
-                                jobLink,
-                                apiEntity.getJobSalaryText(),
-                                apiEntity.getJobArea()
-                            );
-                        } catch (Exception e) {
-                            log.warn("获取猎聘 JD 详情失败: {} | {}", jobLink, e.getMessage());
-                        } finally {
-                            detailPage.close();
-                        }
-                    }
+                    // 安全调整：不再自动打开详情页抓取 JD，仅同步列表页可见信息
+                    jobWorkspaceService.processJob(
+                        "liepin",
+                        String.valueOf(apiEntity.getJobId()),
+                        apiEntity.getJobTitle(),
+                        apiEntity.getCompName(),
+                        "待详情页加载...", // 暂时占位，避免触发风控
+                        jobLink,
+                        apiEntity.getJobSalaryText(),
+                        apiEntity.getJobArea()
+                    );
                 }
 
                 // 2. 模拟鼠标悬停 (保留原有投递辅助逻辑)
@@ -443,12 +477,27 @@ public class Liepin {
             if (jobIdForUpdate == null) {
                 jobIdForUpdate = extractJobIdFromCard(currentJobCard);
             }
+            if (jobIdForUpdate != null) {
+                scannedCount++;
+            }
+            boolean targeted = targetJobIds != null && !targetJobIds.isEmpty();
+            if (targeted && (jobIdForUpdate == null || !targetJobIds.contains(jobIdForUpdate))) {
+                continue;
+            }
 
             // 检查按钮文本并禁用自动点击
             if (button != null && buttonText.contains("聊一聊")) {
                 try {
-                    // 已按要求禁用自动投递，改为在工作台手动投递
-                    log.info("已跳过自动投递(聊一聊): {} @ {}", jobName, companyName);
+                    if (fetchOnly || !targeted) {
+                        log.info("已跳过自动投递(聊一聊): {} @ {}", jobName, companyName);
+                    } else {
+                        button.click();
+                        Thread.sleep(1000);
+                        if (jobIdForUpdate != null) {
+                            liepinService.markDelivered(jobIdForUpdate);
+                        }
+                        log.info("猎聘定向投递完成: {} @ {}", jobName, companyName);
+                    }
                     
                     resultList.add(sb.append("【").append(companyName).append(" ").append(jobName).append(" ").append(salary).append(" ").append(recruiterName).append(" ").append("】").toString());
                     sb.setLength(0);

@@ -11,9 +11,16 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Service;
 
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.function.Consumer;
+
+import com.getjobs.application.event.CrawlCompletedEvent;
+import org.springframework.context.ApplicationEventPublisher;
+import org.springframework.context.ApplicationEventPublisherAware;
 
 /**
  * 51job任务服务
@@ -22,58 +29,117 @@ import java.util.function.Consumer;
 @Slf4j
 @Service
 @RequiredArgsConstructor
-public class Job51JobService implements JobPlatformService {
+public class Job51JobService implements JobPlatformService, ApplicationEventPublisherAware {
     private static final String PLATFORM = "51job";
 
     private final PlaywrightManager playwrightManager;
     private final ObjectProvider<Job51> job51Provider;
     private final ConfigService configService;
+    private ApplicationEventPublisher eventPublisher;
+
+    @Override
+    public void setApplicationEventPublisher(ApplicationEventPublisher applicationEventPublisher) {
+        this.eventPublisher = applicationEventPublisher;
+    }
 
     // 任务运行状态
     private volatile boolean isRunning = false;
     // 停止标志
     private volatile boolean shouldStop = false;
+    // 当前运行的 worker 实例
+    private volatile Job51 currentWorker = null;
 
     @Override
     public void executeDelivery(Consumer<JobProgressMessage> progressCallback) {
+        runJob51Task(configService.getJob51Config(), job51 -> {
+        }, progressCallback, count -> String.format("投递任务完成，共投递%d个职位", count));
+    }
+
+    public void executeCrawl(Consumer<JobProgressMessage> progressCallback) {
+        runJob51Task(configService.getJob51Config(), job51 -> {
+            job51.setFetchOnly(true);
+        }, progressCallback, count -> String.format("抓取任务完成，共处理%d个职位", count), null, "crawl");
+    }
+
+    public Map<String, Object> refreshFirstPage() {
+        Map<String, Object> summary = new HashMap<>();
+        List<String> logs = new ArrayList<>();
+        Job51Config config = configService.getJob51Config();
+        config.setKeywords(limitList(config.getKeywords(), 1));
+        config.setJobArea(limitList(config.getJobArea(), 1));
+        int maxItems = Math.min(80, Math.max(1, config.getMaxItems() != null ? config.getMaxItems() : 30));
+        runJob51Task(config, job51 -> {
+            job51.setFetchOnly(true);
+            job51.setMaxInitialItems(maxItems);
+            // 51job 1 页 50 条，如果 maxItems <= 50，限制 1 页即可
+            job51.setMaxPageLimit(maxItems <= 50 ? 1 : (int) Math.ceil(maxItems / 50.0));
+        }, msg -> logs.add(msg.getMessage()), count -> String.format("增量刷新完成，本次处理%d个职位", count), summary, "crawl");
+        summary.put("logs", logs);
+        return summary;
+    }
+
+    public Map<String, Object> deliverTargetJobs(Set<Long> targetJobIds) {
+        Map<String, Object> summary = new HashMap<>();
+        List<String> logs = new ArrayList<>();
+        runJob51Task(configService.getJob51Config(), job51 -> {
+            job51.setTargetJobIds(targetJobIds);
+        }, msg -> logs.add(msg.getMessage()), count -> String.format("定向投递完成，共处理%d个职位", count), summary, "execute");
+        summary.put("logs", logs);
+        return summary;
+    }
+
+    private void runJob51Task(Job51Config config,
+                              Consumer<Job51> customizer,
+                              Consumer<JobProgressMessage> progressCallback,
+                              java.util.function.IntFunction<String> successMessageBuilder) {
+        runJob51Task(config, customizer, progressCallback, successMessageBuilder, null, "execute");
+    }
+
+    private void runJob51Task(Job51Config config,
+                              Consumer<Job51> customizer,
+                              Consumer<JobProgressMessage> progressCallback,
+                              java.util.function.IntFunction<String> successMessageBuilder,
+                              Map<String, Object> summary,
+                              String action) {
         if (isRunning) {
             progressCallback.accept(JobProgressMessage.warning(PLATFORM, "任务已在运行中"));
+            if (summary != null) {
+                summary.put("success", false);
+                summary.put("message", "任务已在运行中");
+            }
             return;
         }
 
         try {
-            // 获取51job页面实例
             Page page = playwrightManager.getJob51Page();
             if (page == null) {
                 progressCallback.accept(JobProgressMessage.error(PLATFORM, "51job页面未初始化"));
+                if (summary != null) {
+                    summary.put("success", false);
+                    summary.put("message", "51job页面未初始化");
+                }
                 return;
             }
 
-            // 检查是否已登录
             if (!playwrightManager.isLoggedIn(PLATFORM)) {
                 progressCallback.accept(JobProgressMessage.error(PLATFORM, "请先登录51job"));
+                if (summary != null) {
+                    summary.put("success", false);
+                    summary.put("message", "请先登录51job");
+                    summary.put("needLogin", true);
+                }
                 return;
             }
 
-            // 通过校验后再标记运行
             isRunning = true;
             shouldStop = false;
-
-            // 暂停后台登录监控，避免与投递流程并发访问同一Page
             playwrightManager.pause51jobMonitoring();
-
-            // 加载配置（统一从 job51_config 专表读取）
-            Job51Config config = configService.getJob51Config();
             progressCallback.accept(JobProgressMessage.info(PLATFORM, "配置加载成功"));
+            progressCallback.accept(JobProgressMessage.info(PLATFORM, "开始执行任务..."));
 
-            progressCallback.accept(JobProgressMessage.info(PLATFORM, "开始投递任务..."));
-
-            // 创建Job51实例并执行投递
             Job51.ProgressCallback job51Callback = (message, current, total) -> {
-                // 拦截特定警告：当前页未采集到任何 jobId => 视为达到投递上限，自动停止并告警
                 if (message != null && message.contains("当前页未采集到任何 jobId")) {
                     progressCallback.accept(JobProgressMessage.warning(PLATFORM, "检测到当前页无岗位ID，疑似达到上限或页面变化，任务已停止"));
-                    // 设置停止标志，Job51 将在下一次 shouldStop() 检查时退出
                     stopDelivery();
                     return;
                 }
@@ -85,23 +151,36 @@ public class Job51JobService implements JobPlatformService {
             };
 
             Job51 job51 = job51Provider.getObject();
+            this.currentWorker = job51;
             job51.setPage(page);
             job51.setConfig(config);
             job51.setProgressCallback(job51Callback);
             job51.setShouldStopCallback(this::shouldStop);
+            customizer.accept(job51);
             job51.prepare();
 
-            int deliveredCount = job51.execute();
-
-            progressCallback.accept(JobProgressMessage.success(PLATFORM,
-                String.format("投递任务完成，共投递%d个职位", deliveredCount)));
+            int resultCount = "crawl".equals(action) ? job51.crawl() : job51.execute();
+            progressCallback.accept(JobProgressMessage.success(PLATFORM, successMessageBuilder.apply(resultCount)));
+            if (summary != null) {
+                summary.put("success", true);
+                summary.put("message", successMessageBuilder.apply(resultCount));
+                summary.put("scannedCount", job51.getScannedCount());
+                summary.put("resultCount", resultCount);
+            }
+            if ("crawl".equals(action) && resultCount > 0) {
+                eventPublisher.publishEvent(new CrawlCompletedEvent(this, PLATFORM, resultCount));
+            }
         } catch (Exception e) {
-            log.error("51job投递任务执行失败", e);
-            progressCallback.accept(JobProgressMessage.error(PLATFORM, "投递失败: " + e.getMessage()));
+            log.error("51job任务执行失败", e);
+            progressCallback.accept(JobProgressMessage.error(PLATFORM, "任务失败: " + e.getMessage()));
+            if (summary != null) {
+                summary.put("success", false);
+                summary.put("message", "任务失败: " + e.getMessage());
+            }
         } finally {
             isRunning = false;
             shouldStop = false;
-            // 恢复后台登录监控
+            currentWorker = null;
             try {
                 playwrightManager.resume51jobMonitoring();
             } catch (Exception ignored) {}
@@ -113,6 +192,9 @@ public class Job51JobService implements JobPlatformService {
         if (isRunning) {
             log.info("收到停止51job投递任务的请求");
             shouldStop = true;
+            if (currentWorker != null) {
+                currentWorker.cancel();
+            }
         }
     }
 
@@ -142,5 +224,8 @@ public class Job51JobService implements JobPlatformService {
         return shouldStop;
     }
 
-    
+    private <T> List<T> limitList(List<T> source, int max) {
+        if (source == null || source.isEmpty()) return source;
+        return new ArrayList<>(source.subList(0, Math.min(max, source.size())));
+    }
 }

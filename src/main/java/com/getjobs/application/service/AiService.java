@@ -57,6 +57,17 @@ public class AiService {
         JSONObject requestData = new JSONObject();
         requestData.put("model", model);
         requestData.put("temperature", 0.5);
+
+        // 增加 max_tokens 封顶，防止失控扣费
+        try {
+            String maxTokensVal = configService.getConfigValue("MAX_TOKENS");
+            if (maxTokensVal != null && !maxTokensVal.isBlank()) {
+                requestData.put("max_tokens", Integer.parseInt(maxTokensVal));
+            } else {
+                requestData.put("max_tokens", 2000); // 默认封顶
+            }
+        } catch (Exception ignore) {}
+
         if (endpoint.endsWith("/responses")) {
             // Responses API 采用 input 字段
             requestData.put("input", content);

@@ -14,7 +14,9 @@ import org.springframework.context.annotation.Scope;
 import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
+import java.util.Set;
 import java.util.function.Supplier;
 
 /**
@@ -43,6 +45,20 @@ public class ZhiLian {
     private final List<Job> resultList = new ArrayList<>();
     private boolean isLimit = false;
     private int maxPage = 500;
+    @Setter
+    private boolean fetchOnly = false;
+    @Setter
+    private Set<String> targetJobIds = Collections.emptySet();
+    @Setter
+    private int maxPageLimit = 50;
+    @Setter
+    private int maxInitialItems = 30;
+    private int scannedCount = 0;
+
+    /**
+     * 停止标志
+     */
+    private volatile boolean cancelled = false;
 
     private static final String HOME_URL = "https://www.zhaopin.com/sou/";
 
@@ -77,7 +93,17 @@ public class ZhiLian {
         log.info("智联招聘准备工作开始...");
         resultList.clear();
         isLimit = false;
+        scannedCount = 0;
+        cancelled = false;
         log.info("智联招聘准备工作完成");
+    }
+
+    /**
+     * 执行抓取任务
+     */
+    public int crawl() {
+        this.fetchOnly = true;
+        return execute();
     }
 
     /**
@@ -144,8 +170,9 @@ public class ZhiLian {
                     log.warn("未找到搜索输入框，跳过关键词: {}", keyword);
                     return;
                 }
+                String cleanKeyword = keyword == null ? "" : keyword.replace("\"", "").trim();
                 keywordInput.fill("");
-                keywordInput.fill(keyword);
+                keywordInput.fill(cleanKeyword);
                 try { keywordInput.press("Enter"); } catch (Exception ignored) {}
                 PlaywrightUtil.sleep(2);
             } catch (Exception e) {
@@ -164,14 +191,15 @@ public class ZhiLian {
 
             // 遍历所有页面：仅以“下一页”按钮禁用状态为主，最多50页
             int pageNum = 1;
-            while (pageNum <= 50) {
+            int totalPages = Math.max(1, Math.min(maxPage, maxPageLimit));
+            while (pageNum <= totalPages) {
                 if (shouldStop() || isLimit) {
                     sendProgress("用户取消投递或已达上限", null, null);
                     return;
                 }
 
                 log.info("开始投递【{}】关键词，第【{}】页...", keyword, pageNum);
-                sendProgress(String.format("正在投递第%d页", pageNum), pageNum, 50);
+                sendProgress(String.format("正在投递第%d页", pageNum), pageNum, totalPages);
 
                 // 等待岗位列表出现（CSS选择器）
                 try {
@@ -254,6 +282,9 @@ public class ZhiLian {
                 String companyName = safeGetText(card, "div.companyinfo__name");
 
                 String jobId = extractJobIdFromLink(jobLink);
+                if (jobId != null && !jobId.trim().isEmpty()) {
+                    scannedCount++;
+                }
 
                 try {
                     String jid = jobId == null ? "" : jobId.trim();
@@ -304,6 +335,14 @@ public class ZhiLian {
                 if (shouldStop()) {
                     sendProgress("用户取消投递或已达上限", null, null);
                     return false;
+                }
+
+                boolean targeted = targetJobIds != null && !targetJobIds.isEmpty();
+                if (targeted && (pj.jobId == null || !targetJobIds.contains(pj.jobId))) {
+                    continue;
+                }
+                if (fetchOnly && !targeted) {
+                    continue;
                 }
 
                 Locator card = page.locator("div.joblist-box__item").nth(pj.index);
@@ -632,10 +671,18 @@ public class ZhiLian {
         }
     }
 
+    public int getScannedCount() {
+        return scannedCount;
+    }
+
     /**
      * 检查是否应该停止
      */
     private boolean shouldStop() {
-        return shouldStopCallback != null && shouldStopCallback.get();
+        return cancelled || (shouldStopCallback != null && shouldStopCallback.get());
+    }
+
+    public void cancel() {
+        this.cancelled = true;
     }
 }

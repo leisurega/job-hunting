@@ -52,4 +52,16 @@ public class AsyncConfig implements AsyncConfigurer {
         
         return executor;
     }
+
+    @Bean(name = "analyzeExecutor")
+    public Executor analyzeExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(1);
+        executor.setMaxPoolSize(1);
+        executor.setQueueCapacity(50);
+        executor.setThreadNamePrefix("AI-Analyze-");
+        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.DiscardPolicy());
+        executor.initialize();
+        return executor;
+    }
 }

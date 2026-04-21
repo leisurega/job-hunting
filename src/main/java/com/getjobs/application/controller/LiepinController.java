@@ -65,10 +65,45 @@ public class LiepinController {
         }
     }
 
+    /** POST - 启动猎聘抓取任务 */
+    @PostMapping("/crawl")
+    public ResponseEntity<Map<String, Object>> crawlLiepin() {
+        Map<String, Object> response = new HashMap<>();
+        try {
+            if (!playwrightManager.isLoggedIn("liepin")) {
+                response.put("success", false);
+                response.put("message", "请先登录猎聘");
+                response.put("status", "not_logged_in");
+                response.put("needLogin", true);
+                return ResponseEntity.ok(response);
+            }
+            if (liepinJobService.isRunning()) {
+                response.put("success", false);
+                response.put("message", "猎聘任务已在运行中，请等待当前任务完成");
+                response.put("status", "running");
+                return ResponseEntity.badRequest().body(response);
+            }
+            CompletableFuture.runAsync(() -> liepinJobService.executeCrawl(pm -> {
+                log.info("[{}] {}", pm.getPlatform(), pm.getMessage());
+            }));
+            response.put("success", true);
+            response.put("message", "猎聘抓取任务启动成功");
+            response.put("status", "started");
+            return ResponseEntity.ok(response);
+        } catch (Exception e) {
+            log.error("启动猎聘抓取任务失败", e);
+            response.put("success", false);
+            response.put("message", "启动猎聘抓取任务失败: " + e.getMessage());
+            return ResponseEntity.internalServerError().body(response);
+        }
+    }
+
     /**
      * 启动猎聘自动投递任务
      * @return 响应结果
+     * @deprecated 请使用 /crawl 仅抓取，或在工作台执行投递
      */
+    @Deprecated
     @PostMapping("/start")
     public ResponseEntity<Map<String, Object>> startLiepinJob() {
         Map<String, Object> response = new HashMap<>();

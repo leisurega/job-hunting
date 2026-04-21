@@ -214,7 +214,7 @@ function badgeClass(type: "status" | "delivery", text?: string) {
   if (type === "delivery") {
     if (!text || text === "未投递") return `${base} bg-yellow-100 text-yellow-800 dark:bg-yellow-900/40 dark:text-yellow-200`
     if (text === "已投递") return `${base} bg-green-100 text-green-800 dark:bg-green-900/40 dark:text-green-200`
-    if (text === "已过滤") return `${base} bg-gray-100 text-gray-800 dark:bg-gray-900/40 dark:text-gray-200`
+    if (text === "已过滤" || text === "已忽略") return `${base} bg-gray-100 text-gray-800 dark:bg-gray-900/40 dark:text-gray-200`
     if (text === "投递失败") return `${base} bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-200`
     return `${base} bg-gray-100 text-gray-800`
   }
@@ -224,6 +224,7 @@ function badgeClass(type: "status" | "delivery", text?: string) {
 export default function AnalysisContent({ showHeader = false }: { showHeader?: boolean }) {
   const [stats, setStats] = useState<StatsResponse | null>(null)
   const [loadingStats, setLoadingStats] = useState(true)
+  const [statsError, setStatsError] = useState<string | null>(null)
 
   const [items, setItems] = useState<ZhilianJob[]>([])
   const [total, setTotal] = useState(0)
@@ -244,11 +245,12 @@ export default function AnalysisContent({ showHeader = false }: { showHeader?: b
   const [reloading, setReloading] = useState(false)
   const [computedSalaryBuckets, setComputedSalaryBuckets] = useState<BucketValue[]>([])
 
-  const statusOptions = ["未投递", "已投递", "已过滤", "投递失败"]
+  const statusOptions = ["未投递", "已投递", "已忽略", "投递失败"]
 
   const loadList = async (toPage = page, toSize = size) => {
     try {
       const params = new URLSearchParams()
+      params.set("platform", "zhilian")
       if (statuses.length) params.set("statuses", statuses.join(","))
       if (location) params.set("location", location)
       if (experience) params.set("experience", experience)
@@ -258,21 +260,23 @@ export default function AnalysisContent({ showHeader = false }: { showHeader?: b
       if (keyword) params.set("keyword", keyword)
       params.set("page", String(toPage))
       params.set("size", String(toSize))
-      const res = await fetch(`${API_BASE}/api/zhilian/list?${params.toString()}`)
-      const data: PagedResult = await res.json()
-      setItems(data.items || [])
-      setTotal(data.total || 0)
-      setPage(data.page || toPage)
-      setSize(data.size || toSize)
+      const res = await fetch(`${API_BASE}/api/workspace/list?${params.toString()}`)
+      const data = await res.json()
+      // 注意：workspace/list 返回的是 List<JobWorkspaceEntity>，不是 PagedResult
+      // 如果需要分页，后端 list 接口也需要支持。目前先简单处理。
+      setItems(data || [])
+      setTotal(data.length || 0)
     } catch (e) {
       console.error("fetch zhilian list failed", e)
     }
   }
 
-  const loadStats = async () => {
+  const loadStats = async (attempt = 0) => {
     try {
       setLoadingStats(true)
+      setStatsError(null)
       const params = new URLSearchParams()
+      params.set("platform", "zhilian")
       if (statuses.length) params.set("statuses", statuses.join(","))
       if (location) params.set("location", location)
       if (experience) params.set("experience", experience)
@@ -280,14 +284,33 @@ export default function AnalysisContent({ showHeader = false }: { showHeader?: b
       if (minK) params.set("minK", String(Number(minK)))
       if (maxK) params.set("maxK", String(Number(maxK)))
       if (keyword) params.set("keyword", keyword)
-      const res = await fetch(`${API_BASE}/api/zhilian/stats?${params.toString()}`)
+      const res = await fetch(`${API_BASE}/api/workspace/stats?${params.toString()}`)
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
       const data: StatsResponse = await res.json()
       setStats(data)
     } catch (e) {
       console.error("fetch zhilian stats failed", e)
+      if (attempt < 2) {
+        const delay = 1000 * Math.pow(2, attempt)
+        setTimeout(() => loadStats(attempt + 1), delay)
+        return
+      }
+      setStatsError(e instanceof Error ? e.message : String(e))
     } finally {
       setLoadingStats(false)
     }
+  }
+
+  const renderChartPlaceholder = () => {
+    if (statsError) {
+      return (
+        <div className="h-64 flex flex-col items-center justify-center border border-dashed rounded-lg text-muted-foreground gap-2">
+          <span className="text-sm text-red-500">加载失败: {statsError}</span>
+          <Button size="sm" variant="outline" onClick={() => loadStats()}>重试</Button>
+        </div>
+      )
+    }
+    return <div className="h-64 flex items-center justify-center border border-dashed rounded-lg text-muted-foreground">{loadingStats ? "加载中..." : "暂无数据"}</div>
   }
 
   useEffect(() => {
@@ -447,6 +470,7 @@ export default function AnalysisContent({ showHeader = false }: { showHeader?: b
       { title: "总岗位数", value: k?.total ?? 0 },
       { title: "已投递", value: k?.delivered ?? 0 },
       { title: "未投递", value: k?.pending ?? 0 },
+      { title: "已忽略", value: k?.filtered ?? 0 },
       { title: "平均月薪(K)", value: (k?.avgMonthlyK ?? avgMonthlyKFromItems ?? 0) },
     ]
   }, [stats, items])
@@ -561,9 +585,7 @@ export default function AnalysisContent({ showHeader = false }: { showHeader?: b
           <CardContent>
             {stats ? (
               <ChartCanvas type="pie" labels={stats.charts.byStatus.map((x) => x.name)} data={stats.charts.byStatus.map((x) => x.value)} colors={CATEGORY_COLORS} />
-            ) : (
-              <div className="text-muted-foreground">加载中...</div>
-            )}
+            ) : renderChartPlaceholder()}
           </CardContent>
         </Card>
 
@@ -575,9 +597,7 @@ export default function AnalysisContent({ showHeader = false }: { showHeader?: b
           <CardContent>
             {stats ? (
               <ChartCanvas type="bar" labels={stats.charts.byCity.map((x) => x.name)} data={stats.charts.byCity.map((x) => x.value)} color="#3b82f6" />
-            ) : (
-              <div className="text-muted-foreground">加载中...</div>
-            )}
+            ) : renderChartPlaceholder()}
           </CardContent>
         </Card>
 
@@ -589,9 +609,7 @@ export default function AnalysisContent({ showHeader = false }: { showHeader?: b
           <CardContent>
             {stats ? (
               <ChartCanvas type="bar" labels={stats.charts.byCompany.map((x) => x.name)} data={stats.charts.byCompany.map((x) => x.value)} color="#10b981" />
-            ) : (
-              <div className="text-muted-foreground">加载中...</div>
-            )}
+            ) : renderChartPlaceholder()}
           </CardContent>
         </Card>
 
@@ -603,9 +621,7 @@ export default function AnalysisContent({ showHeader = false }: { showHeader?: b
           <CardContent>
             {stats ? (
               <ChartCanvas type="bar" labels={stats.charts.byExperience.map((x) => x.name)} data={stats.charts.byExperience.map((x) => x.value)} color="#f59e0b" />
-            ) : (
-              <div className="text-muted-foreground">加载中...</div>
-            )}
+            ) : renderChartPlaceholder()}
           </CardContent>
         </Card>
 
@@ -617,9 +633,7 @@ export default function AnalysisContent({ showHeader = false }: { showHeader?: b
           <CardContent>
             {stats ? (
               <ChartCanvas type="bar" labels={stats.charts.byDegree.map((x) => x.name)} data={stats.charts.byDegree.map((x) => x.value)} color="#6366f1" />
-            ) : (
-              <div className="text-muted-foreground">加载中...</div>
-            )}
+            ) : renderChartPlaceholder()}
           </CardContent>
         </Card>
 

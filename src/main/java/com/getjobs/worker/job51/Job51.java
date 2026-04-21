@@ -14,7 +14,9 @@ import org.springframework.context.annotation.Scope;
 import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
+import java.util.Set;
 import java.util.function.Supplier;
 
 /**
@@ -49,6 +51,21 @@ public class Job51 {
     private boolean reachedDailyLimit = false;
     @Getter
     private int currentPageNum = 0;
+    @Setter
+    private boolean fetchOnly = false;
+    @Setter
+    private Set<Long> targetJobIds = Collections.emptySet();
+    @Setter
+    private int maxPageLimit = DEFAULT_MAX_PAGE;
+    @Setter
+    private int maxInitialItems = 30;
+    @Getter
+    private int scannedCount = 0;
+
+    /**
+     * 停止标志
+     */
+    private volatile boolean cancelled = false;
 
     private static final int DEFAULT_MAX_PAGE = 50;
     private static final String BASE_URL = "https://we.51job.com/pc/search?";
@@ -66,6 +83,18 @@ public class Job51 {
      */
     public void prepare() {
         resultList.clear();
+        reachedDailyLimit = false;
+        currentPageNum = 0;
+        scannedCount = 0;
+        cancelled = false;
+    }
+
+    /**
+     * 执行抓取任务
+     */
+    public int crawl() {
+        this.fetchOnly = true;
+        return execute();
     }
 
     /**
@@ -149,13 +178,14 @@ public class Job51 {
             } catch (Exception e) { /* 静默 */ }
 
             // 遍历页面投递
-            for (int pageNum = 1; pageNum <= DEFAULT_MAX_PAGE; pageNum++) {
+            int totalPages = Math.max(1, maxPageLimit);
+            for (int pageNum = 1; pageNum <= totalPages; pageNum++) {
                 if (shouldStop()) {
                     sendProgress("用户取消投递", null, null);
                     return;
                 }
 
-                sendProgress(String.format("正在投递第%d页", pageNum), pageNum, DEFAULT_MAX_PAGE);
+                sendProgress(String.format("正在投递第%d页", pageNum), pageNum, totalPages);
                 currentPageNum = pageNum;
 
                 // 跳转到指定页码
@@ -196,6 +226,8 @@ public class Job51 {
     private void deliverCurrentPage() {
         try {
             PlaywrightUtil.sleep(1);
+            boolean deliveryEnabled = !fetchOnly && targetJobIds != null && !targetJobIds.isEmpty();
+            List<Long> selectedJobIds = new ArrayList<>();
 
             // 查找所有职位的checkbox
             Locator checkboxes = page.locator("div.ick");
@@ -220,38 +252,30 @@ public class Job51 {
                     // 获取详情链接并分析
                     Locator titleLink = titles.nth(i).locator("a");
                     String jobLink = titleLink.getAttribute("href");
-                    if (jobLink != null && !jobLink.isEmpty()) {
-                        Page detailPage = page.context().newPage();
-                        try {
-                            detailPage.navigate(jobLink, new Page.NavigateOptions().setTimeout(15000));
-                            // 51job JD 选择器
-                            detailPage.waitForSelector(".job-intro, .bmsg", new Page.WaitForSelectorOptions().setTimeout(10000));
-                            String jdText = detailPage.locator(".job-intro, .bmsg").innerText();
-                            
-                            // 提取 jobId
-                            Long jobId = parseJobIdFromHref(jobLink);
-                            
-                            // 同步到工作台
-                            jobWorkspaceService.processJob(
-                                "job51",
-                                String.valueOf(jobId),
-                                title,
-                                company,
-                                jdText,
-                                jobLink,
-                                "请查看详情", // 51 列表薪资解析稍后在服务层增强
-                                "请查看详情"
-                            );
-                        } catch (Exception e) {
-                            log.warn("获取 51job JD 详情失败: {} | {}", jobLink, e.getMessage());
-                        } finally {
-                            detailPage.close();
-                        }
+                    Long jobId = parseJobIdFromHref(jobLink);
+                    if (jobId != null) {
+                        scannedCount++;
                     }
+                    // 安全调整：不再自动打开详情页抓取 JD，仅同步列表页可见信息
+                    jobWorkspaceService.processJob(
+                        "job51",
+                        String.valueOf(jobId),
+                        title,
+                        company,
+                        "待详情页加载...", // 暂时占位，避免触发风控
+                        jobLink,
+                        "请查看详情", 
+                        "请查看详情"
+                    );
 
-                    Locator checkbox = checkboxes.nth(i);
-                    // 使用JavaScript点击，避免元素被遮挡
-                    checkbox.evaluate("el => el.click()");
+                    if (deliveryEnabled) {
+                        if (jobId == null || !targetJobIds.contains(jobId)) {
+                            continue;
+                        }
+                        Locator checkbox = checkboxes.nth(i);
+                        checkbox.evaluate("el => el.click()");
+                        selectedJobIds.add(jobId);
+                    }
 
                     String jobInfo = company + " | " + title;
                     resultList.add(jobInfo);
@@ -260,13 +284,28 @@ public class Job51 {
 
             PlaywrightUtil.sleep(1);
 
-            // 已按要求禁用自动批量投递，改为在工作台手动投递
-            log.info("[51job] 已完成当前页 {} 个职位的分析，跳过自动批量投递", jobCount);
-            sendProgress(String.format("已分析 %d 个职位，请在工作台查看并手动投递", jobCount), null, null);
+            if (!deliveryEnabled) {
+                log.info("[51job] 已完成当前页 {} 个职位的分析，跳过自动批量投递", jobCount);
+                sendProgress(String.format("已分析 %d 个职位，请在工作台查看并手动投递", jobCount), null, null);
+                return;
+            }
 
-            // 原有投递逻辑已禁用：
-            // clickBatchDeliverButton();
-            // ...
+            if (selectedJobIds.isEmpty()) {
+                log.info("[51job] 当前页没有命中的定向岗位，跳过投递");
+                return;
+            }
+
+            clickBatchDeliverButton();
+            if (!reachedDailyLimit) {
+                handleDeliverySuccessDialog();
+                handleSeparateDeliveryDialog();
+                try {
+                    job51Service.markDeliveredBatch(selectedJobIds);
+                } catch (Exception e) {
+                    log.warn("[51job] 更新定向投递状态失败: {}", e.getMessage());
+                }
+                sendProgress(String.format("已尝试投递 %d 个选中职位", selectedJobIds.size()), null, null);
+            }
 
         } catch (Exception e) {
             log.error("投递当前页面失败", e);
@@ -666,7 +705,9 @@ public class Job51 {
         StringBuilder url = new StringBuilder(BASE_URL);
         url.append(JobUtils.appendListParam("jobArea", config.getJobArea()));
         url.append(JobUtils.appendListParam("salary", config.getSalary()));
-        url.append("&keyword=").append(keyword);
+        String cleanKeyword = keyword == null ? "" : keyword.replace("\"", "").trim();
+        String encodedKeyword = java.net.URLEncoder.encode(cleanKeyword, java.nio.charset.StandardCharsets.UTF_8);
+        url.append("&keyword=").append(encodedKeyword);
         return url.toString();
     }
 
@@ -787,6 +828,10 @@ public class Job51 {
      * 检查是否应该停止
      */
     private boolean shouldStop() {
-        return shouldStopCallback != null && shouldStopCallback.get();
+        return cancelled || (shouldStopCallback != null && shouldStopCallback.get());
+    }
+
+    public void cancel() {
+        this.cancelled = true;
     }
 }

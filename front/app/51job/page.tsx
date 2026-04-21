@@ -17,6 +17,7 @@ interface Job51Config {
   keywords?: string
   jobArea?: string
   salary?: string // 存储JSON数组字符串，如 ["03","04","05"]
+  maxItems?: number
 }
 
 interface Job51Option { name: string; code: string }
@@ -29,6 +30,9 @@ export default function Job51Page() {
   const API = process.env.API_BASE_URL || 'http://localhost:8888'
   const [isLoggedIn, setIsLoggedIn] = useState(false)
   const [isDelivering, setIsDelivering] = useState(false)
+  const [isCrawling, setIsCrawling] = useState(false)
+  const [isAnalyzing, setIsAnalyzing] = useState(false)
+  const [analyzeProgress, setAnalyzeProgress] = useState({ done: 0, total: 0 })
   const [checkingLogin, setCheckingLogin] = useState(true)
   const [showLogoutDialog, setShowLogoutDialog] = useState(false)
   const [showSaveDialog, setShowSaveDialog] = useState(false)
@@ -36,7 +40,7 @@ export default function Job51Page() {
   const [showLogoutResultDialog, setShowLogoutResultDialog] = useState(false)
   const [logoutResult, setLogoutResult] = useState<{ success: boolean; message: string } | null>(null)
 
-  const [config, setConfig] = useState<Job51Config>({ keywords: '', jobArea: '', salary: '' })
+  const [config, setConfig] = useState<Job51Config>({ keywords: '', jobArea: '', salary: '', maxItems: 30 })
   const [options, setOptions] = useState<Job51Options>({ jobArea: [], salary: [] })
   const [loadingConfig, setLoadingConfig] = useState(true)
   const [isCustomArea, setIsCustomArea] = useState(false)
@@ -241,7 +245,7 @@ export default function Job51Page() {
         const areaCode = matchArea?.code || (areaList.find((o) => o.name === '不限')?.code || areaList.find((o) => o.code === '0')?.code || '')
 
         setOptions(opts)
-        setConfig({ ...conf, keywords: normalizedKeywords, jobArea: areaCode, salary: JSON.stringify(salaryCodes) })
+        setConfig({ ...conf, keywords: normalizedKeywords, jobArea: areaCode, salary: JSON.stringify(salaryCodes), maxItems: conf.maxItems ?? 30 })
         setSelectedSalaries(salaryCodes)
         setIsCustomArea(false)
       }
@@ -270,6 +274,52 @@ export default function Job51Page() {
       }
     })()
   }, [])
+
+  const handleCrawl = async () => {
+    try {
+      setIsCrawling(true)
+      const response = await fetch(`${API}/api/51job/crawl`, { method: 'POST' })
+      const data = await response.json()
+      if (!data.success) {
+        console.warn('[51job] 抓取启动失败：', data.message)
+        setIsCrawling(false)
+      }
+    } catch (error) {
+      console.error('[51job] 启动抓取失败：', error)
+      setIsCrawling(false)
+    }
+  }
+
+  const handleAnalyze = async () => {
+    try {
+      setIsAnalyzing(true)
+      const response = await fetch(`${API}/api/workspace/analyze`, { method: 'POST' })
+      const data = await response.json()
+      if (data.success) {
+        pollAnalyzeStatus()
+      } else {
+        setIsAnalyzing(false)
+      }
+    } catch (error) {
+      console.error('[51job] 启动分析失败：', error)
+      setIsAnalyzing(false)
+    }
+  }
+
+  const pollAnalyzeStatus = async () => {
+    const timer = setInterval(async () => {
+      try {
+        const res = await fetch(`${API}/api/workspace/analyze/status`)
+        const data = await res.json()
+        setAnalyzeProgress({ done: data.done, total: data.total })
+        setIsAnalyzing(data.running)
+        if (!data.running) clearInterval(timer)
+      } catch (e) {
+        clearInterval(timer)
+        setIsAnalyzing(false)
+      }
+    }, 2000)
+  }
 
   const handleStartDelivery = async () => {
     try {
@@ -410,19 +460,35 @@ export default function Job51Page() {
                 <BiPlay className="mr-1" /> 检查登录中...
               </Button>
             ) : !isLoggedIn ? (
-              <Button size="sm" disabled className="rounded-full bg-gray-300 text-gray-600 cursor-not-allowed px-4 shadow">
-                <BiPlay className="mr-1" /> 请先登录51job
+              <Button
+                size="sm"
+                onClick={async () => {
+                  try {
+                    await fetch('http://localhost:8888/api/workspace/open-login', {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ platform: '51job' }),
+                    })
+                    alert('已为你切换到 Playwright Chrome 窗口（顶部有「被自动测试软件控制」提示条），请在该窗口扫码登录 51job')
+                  } catch (e) {
+                    alert('打开登录页失败')
+                  }
+                }}
+                className="rounded-full bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-600 hover:to-orange-600 text-white px-4 shadow-lg hover:shadow-xl transition-all duration-300 hover:scale-105"
+              >
+                <BiPlay className="mr-1" /> 去登录 51job（Playwright）
               </Button>
-            ) : isDelivering ? (
-              <Button onClick={handleStopDelivery} size="sm" className="rounded-full bg-gradient-to-r from-red-500 to-rose-600 hover:from-red-600 hover:to-rose-700 text-white px-4 shadow-lg hover:shadow-xl transition-all duration-300 hover:scale-105">
-                <BiStop className="mr-1" /> 停止投递
-              </Button>
-            ) : (
-              <Button onClick={handleStartDelivery} size="sm" className="rounded-full bg-gradient-to-r from-teal-500 to-green-500 hover:from-teal-600 hover:to-green-600 text-white px-4 shadow-lg hover:shadow-xl transition-all duration-300 hover:scale-105">
-                <BiPlay className="mr-1" /> 开始投递
-              </Button>
-            )}
-            <Button onClick={() => setShowLogoutDialog(true)} size="sm" className="rounded-full bg-gradient-to-r from-red-500 to-pink-500 hover:from-red-600 hover:to-pink-600 text-white px-4 shadow-lg hover:shadow-xl transition-all duration-300 hover:scale-105">
+            ) : null}
+            <Button
+              onClick={() => setShowLogoutDialog(true)}
+              disabled={!isLoggedIn || checkingLogin}
+              size="sm"
+              className={`rounded-full px-4 shadow-lg transition-all duration-300 ${
+                !isLoggedIn || checkingLogin
+                  ? 'bg-gray-300 text-gray-500 cursor-not-allowed'
+                  : 'bg-gradient-to-r from-red-500 to-pink-500 hover:from-red-600 hover:to-pink-600 text-white hover:shadow-xl hover:scale-105'
+              }`}
+            >
               <BiLogOut className="mr-1" /> 退出登录
             </Button>
             <Button onClick={handleSaveConfig} size="sm" className="rounded-full bg-gradient-to-r from-blue-500 to-indigo-500 hover:from-blue-600 hover:to-indigo-600 text-white px-4 shadow-lg hover:shadow-xl transition-all duration-300 hover:scale-105">
@@ -583,6 +649,25 @@ export default function Job51Page() {
                     <p className="text-xs text-muted-foreground">
                       已选择 {selectedSalaries.length}/{MAX_SALARY_SELECTIONS} 个薪资范围
                     </p>
+                  </div>
+
+                  {/* 每次抓取条数 */}
+                  <div className="space-y-2">
+                    <Label htmlFor="maxItems">每次抓取条数 ({config.maxItems ?? 30})</Label>
+                    <div className="flex items-center gap-4">
+                      <input
+                        id="maxItems"
+                        type="range"
+                        min="10"
+                        max="80"
+                        step="1"
+                        value={config.maxItems ?? 30}
+                        onChange={(e) => setConfig((c) => ({ ...c, maxItems: Number(e.target.value) }))}
+                        className="flex-1 h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer accent-blue-500"
+                      />
+                      <span className="text-sm font-medium w-8 text-center">{config.maxItems ?? 30}</span>
+                    </div>
+                    <p className="text-xs text-muted-foreground">设置每次抓取新岗位的最大条数 (10-80)</p>
                   </div>
                 </div>
               )}

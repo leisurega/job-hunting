@@ -8,6 +8,7 @@ import com.getjobs.application.service.CookieService;
 import com.getjobs.application.service.Job51Service;
 import com.getjobs.worker.manager.PlaywrightManager;
 // Boss 控制器已独立，移除 Boss 依赖
+import com.getjobs.application.service.JobWorkspaceService;
 import com.getjobs.worker.service.Job51JobService;
 import com.getjobs.worker.dto.JobProgressMessage;
 import lombok.RequiredArgsConstructor;
@@ -42,14 +43,39 @@ public class JobController {
     private static final ObjectMapper objectMapper = new ObjectMapper();
 
     // Services / Managers
+    private final JobWorkspaceService jobWorkspaceService;
+    private final com.getjobs.application.service.JobWorkspaceBatchAnalyzeService jobWorkspaceBatchAnalyzeService;
+    private final com.getjobs.worker.manager.PlaywrightManager playwrightManager;
     private final Job51Service job51Service;
     private final Job51JobService job51JobService;
-    private final PlaywrightManager playwrightManager;
     private final CookieService cookieService;
 
     // SSE emitter lists
     private final List<SseEmitter> job51ProgressEmitters = new CopyOnWriteArrayList<>();
     private final List<SseEmitter> loginStatusEmitters = new CopyOnWriteArrayList<>();
+    private final List<SseEmitter> workspaceEmitters = new CopyOnWriteArrayList<>();
+
+    @jakarta.annotation.PostConstruct
+    public void init() {
+        jobWorkspaceBatchAnalyzeService.addProgressListener(progress -> {
+            sendWorkspaceEvent("analyze-progress", progress.toString());
+        });
+        jobWorkspaceService.addCrawlProgressListener(progressJson -> {
+            sendWorkspaceEvent("crawl-progress", progressJson);
+        });
+    }
+
+    private void sendWorkspaceEvent(String name, String data) {
+        List<SseEmitter> dead = new ArrayList<>();
+        for (SseEmitter e : workspaceEmitters) {
+            try {
+                e.send(SseEmitter.event().name(name).data(data));
+            } catch (Exception ex) {
+                dead.add(e);
+            }
+        }
+        workspaceEmitters.removeAll(dead);
+    }
 
     // ==================== 51job 投递进度 SSE ====================
 
@@ -130,6 +156,25 @@ public class JobController {
         return emitter;
     }
 
+    /** SSE - 统一工作台事件推送（含分析进度） */
+    @GetMapping(value = "/workspace/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public SseEmitter streamWorkspaceEvents() {
+        SseEmitter emitter = new SseEmitter(0L);
+        workspaceEmitters.add(emitter);
+
+        emitter.onCompletion(() -> workspaceEmitters.remove(emitter));
+        emitter.onTimeout(() -> workspaceEmitters.remove(emitter));
+        emitter.onError(e -> workspaceEmitters.remove(emitter));
+
+        try {
+            emitter.send(SseEmitter.event().name("connected").data("Workspace SSE Connected"));
+        } catch (IOException e) {
+            log.error("发送Workspace SSE连接消息失败", e);
+        }
+
+        return emitter;
+    }
+
     private void sendJob51Progress(JobProgressMessage message) {
         List<SseEmitter> deadEmitters = new CopyOnWriteArrayList<>();
         for (SseEmitter emitter : job51ProgressEmitters) {
@@ -181,7 +226,7 @@ public class JobController {
     }
 
     /** 心跳 - 登录状态 SSE */
-    @Scheduled(fixedRate = 30000)
+    @Scheduled(fixedRate = 300000) // 延长到5分钟一次
     public void heartbeatLoginStatus() {
         if (loginStatusEmitters.isEmpty()) return;
         List<SseEmitter> deadEmitters = new CopyOnWriteArrayList<>();
@@ -205,7 +250,7 @@ public class JobController {
     }
 
     /** 心跳 - Boss进度 SSE */
-    @Scheduled(fixedRate = 30000)
+    @Scheduled(fixedRate = 300000) // 延长到5分钟一次
     public void heartbeatJob51Progress() {
         if (job51ProgressEmitters.isEmpty()) return;
         List<SseEmitter> deadEmitters = new CopyOnWriteArrayList<>();
@@ -379,7 +424,42 @@ public class JobController {
         }
     }
 
-    /** 启动51job自动投递任务 */
+    @PostMapping("/51job/crawl")
+    public ResponseEntity<Map<String, Object>> crawlJob51() {
+        Map<String, Object> response = new HashMap<>();
+        try {
+            if (!playwrightManager.isLoggedIn("51job")) {
+                response.put("success", false);
+                response.put("message", "请先登录51job");
+                response.put("status", "not_logged_in");
+                response.put("needLogin", true);
+                return ResponseEntity.ok(response);
+            }
+            if (job51JobService.isRunning()) {
+                response.put("success", false);
+                response.put("message", "51job任务已在运行中，请等待当前任务完成");
+                response.put("status", "running");
+                return ResponseEntity.badRequest().body(response);
+            }
+            CompletableFuture.runAsync(() -> job51JobService.executeCrawl(pm -> {
+                log.info("[{}] {}", pm.getPlatform(), pm.getMessage());
+            }));
+            response.put("success", true);
+            response.put("message", "51job抓取任务启动成功");
+            response.put("status", "started");
+            return ResponseEntity.ok(response);
+        } catch (Exception e) {
+            log.error("启动51job抓取任务失败", e);
+            response.put("success", false);
+            response.put("message", "启动51job抓取任务失败: " + e.getMessage());
+            return ResponseEntity.internalServerError().body(response);
+        }
+    }
+
+    /** 启动51job自动投递任务
+     * @deprecated 请使用 /crawl 仅抓取，或在工作台执行投递
+     */
+    @Deprecated
     @PostMapping("/51job/start")
     public ResponseEntity<Map<String, Object>> start51jobJob() {
         Map<String, Object> response = new HashMap<>();

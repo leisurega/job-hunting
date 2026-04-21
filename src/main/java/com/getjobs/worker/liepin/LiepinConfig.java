@@ -25,4 +25,9 @@ public class LiepinConfig {
      */
     private String salary;
 
+    /**
+     * 每次抓取最大条数
+     */
+    private Integer maxItems;
+
 }

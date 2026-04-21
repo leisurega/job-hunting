@@ -242,6 +242,7 @@ public class BossService {
         if (partial.getExpectedSalaryMax() != null) existing.setExpectedSalaryMax(partial.getExpectedSalaryMax());
 
         if (partial.getDeadStatus() != null) existing.setDeadStatus(partial.getDeadStatus());
+        if (partial.getMaxItems() != null) existing.setMaxItems(partial.getMaxItems());
 
         existing.setUpdatedAt(now);
         bossConfigMapper.updateById(existing);
@@ -320,6 +321,9 @@ public class BossService {
 
         // HR不在线状态（括号列表字符串）
         config.setDeadStatus(parseListString(entity.getDeadStatus()));
+
+        // 每次抓取最大条数
+        config.setMaxItems(entity.getMaxItems() != null ? entity.getMaxItems() : 30);
 
         log.info("已从 boss_config 加载Boss配置，并完成括号列表解析");
         return config;

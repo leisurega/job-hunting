@@ -77,6 +77,10 @@ public class ZhilianService {
         } else {
             config.setSalary(salary);
         }
+
+        // 每次抓取最大条数
+        config.setMaxItems(entity.getMaxItems() != null ? entity.getMaxItems() : 30);
+
         return config;
     }
 

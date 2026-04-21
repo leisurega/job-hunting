@@ -17,6 +17,7 @@ interface ZhilianConfig {
   keywords?: string
   cityCode?: string
   salary?: string
+  maxItems?: number
 }
 
 interface Option { name: string; code: string }
@@ -25,6 +26,9 @@ interface ZhilianOptions { city: Option[] }
 export default function ZhilianPage() {
   const [isLoggedIn, setIsLoggedIn] = useState(false)
   const [isDelivering, setIsDelivering] = useState(false)
+  const [isCrawling, setIsCrawling] = useState(false)
+  const [isAnalyzing, setIsAnalyzing] = useState(false)
+  const [analyzeProgress, setAnalyzeProgress] = useState({ done: 0, total: 0 })
   const [checkingLogin, setCheckingLogin] = useState(true)
   const [showLogoutDialog, setShowLogoutDialog] = useState(false)
   const [showSaveDialog, setShowSaveDialog] = useState(false)
@@ -33,7 +37,7 @@ export default function ZhilianPage() {
   const [logoutResult, setLogoutResult] = useState<{ success: boolean; message: string } | null>(null)
   const [backendAvailable, setBackendAvailable] = useState(true)
 
-  const [config, setConfig] = useState<ZhilianConfig>({ keywords: '', cityCode: '', salary: '' })
+  const [config, setConfig] = useState<ZhilianConfig>({ keywords: '', cityCode: '', salary: '', maxItems: 30 })
   const [options, setOptions] = useState<ZhilianOptions>({ city: [] })
   const [loadingConfig, setLoadingConfig] = useState(true)
 
@@ -121,6 +125,7 @@ export default function ZhilianPage() {
       if (data.config) {
         const normalized = { ...data.config }
         normalized.keywords = parseKeywordsFromDb(data.config.keywords)
+        normalized.maxItems = data.config.maxItems ?? 30
         setConfig(normalized)
       }
       if (data.options) setOptions(data.options)
@@ -152,6 +157,47 @@ export default function ZhilianPage() {
     })()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
+
+  const handleCrawl = async () => {
+    try {
+      setIsCrawling(true)
+      const response = await fetch('http://localhost:8888/api/zhilian/crawl', { method: 'POST' })
+      const data = await response.json()
+      if (!data.success) setIsCrawling(false)
+    } catch (error) {
+      setIsCrawling(false)
+    }
+  }
+
+  const handleAnalyze = async () => {
+    try {
+      setIsAnalyzing(true)
+      const response = await fetch('http://localhost:8888/api/workspace/analyze', { method: 'POST' })
+      const data = await response.json()
+      if (data.success) {
+        pollAnalyzeStatus()
+      } else {
+        setIsAnalyzing(false)
+      }
+    } catch (error) {
+      setIsAnalyzing(false)
+    }
+  }
+
+  const pollAnalyzeStatus = async () => {
+    const timer = setInterval(async () => {
+      try {
+        const res = await fetch('http://localhost:8888/api/workspace/analyze/status')
+        const data = await res.json()
+        setAnalyzeProgress({ done: data.done, total: data.total })
+        setIsAnalyzing(data.running)
+        if (!data.running) clearInterval(timer)
+      } catch (e) {
+        clearInterval(timer)
+        setIsAnalyzing(false)
+      }
+    }, 2000)
+  }
 
   const handleStartDelivery = async () => {
     try {
@@ -235,19 +281,35 @@ export default function ZhilianPage() {
                 <BiPlay className="mr-1" /> 检查登录中...
               </Button>
             ) : !isLoggedIn ? (
-              <Button size="sm" disabled className="rounded-full bg-gray-300 text-gray-600 cursor-not-allowed px-4 shadow">
-                <BiPlay className="mr-1" /> 请先登录智联招聘
+              <Button
+                size="sm"
+                onClick={async () => {
+                  try {
+                    await fetch('http://localhost:8888/api/workspace/open-login', {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ platform: 'zhilian' }),
+                    })
+                    alert('已为你切换到 Playwright Chrome 窗口（顶部有「被自动测试软件控制」提示条），请在该窗口扫码登录智联招聘')
+                  } catch (e) {
+                    alert('打开登录页失败')
+                  }
+                }}
+                className="rounded-full bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-600 hover:to-orange-600 text-white px-4 shadow-lg hover:shadow-xl transition-all duration-300 hover:scale-105"
+              >
+                <BiPlay className="mr-1" /> 去登录智联招聘（Playwright）
               </Button>
-            ) : isDelivering ? (
-              <Button onClick={handleStopDelivery} size="sm" className="rounded-full bg-gradient-to-r from-red-500 to-rose-600 hover:from-red-600 hover:to-rose-700 text-white px-4 shadow-lg hover:shadow-xl transition-all duration-300 hover:scale-105">
-                <BiStop className="mr-1" /> 停止投递
-              </Button>
-            ) : (
-              <Button onClick={handleStartDelivery} size="sm" className="rounded-full bg-gradient-to-r from-teal-500 to-green-500 hover:from-teal-600 hover:to-green-600 text-white px-4 shadow-lg hover:shadow-xl transition-all duration-300 hover:scale-105">
-                <BiPlay className="mr-1" /> 开始投递
-              </Button>
-            )}
-            <Button onClick={() => setShowLogoutDialog(true)} size="sm" className="rounded-full bg-gradient-to-r from-red-500 to-pink-500 hover:from-red-600 hover:to-pink-600 text-white px-4 shadow-lg hover:shadow-xl transition-all duration-300 hover:scale-105">
+            ) : null}
+            <Button
+              onClick={() => setShowLogoutDialog(true)}
+              disabled={!isLoggedIn || checkingLogin}
+              size="sm"
+              className={`rounded-full px-4 shadow-lg transition-all duration-300 ${
+                !isLoggedIn || checkingLogin
+                  ? 'bg-gray-300 text-gray-500 cursor-not-allowed'
+                  : 'bg-gradient-to-r from-red-500 to-pink-500 hover:from-red-600 hover:to-pink-600 text-white hover:shadow-xl hover:scale-105'
+              }`}
+            >
               <BiLogOut className="mr-1" /> 退出登录
             </Button>
             <Button onClick={handleSaveConfig} size="sm" className="rounded-full bg-gradient-to-r from-blue-500 to-indigo-500 hover:from-blue-600 hover:to-indigo-600 text-white px-4 shadow-lg hover:shadow-xl transition-all duration-300 hover:scale-105">
@@ -320,6 +382,25 @@ export default function ZhilianPage() {
                       value={config.salary || ''}
                       onChange={(e) => setConfig((c) => ({ ...c, salary: e.target.value }))}
                     />
+                  </div>
+
+                  {/* 每次抓取条数 */}
+                  <div className="space-y-2">
+                    <Label htmlFor="maxItems">每次抓取条数 ({config.maxItems ?? 30})</Label>
+                    <div className="flex items-center gap-4">
+                      <input
+                        id="maxItems"
+                        type="range"
+                        min="10"
+                        max="80"
+                        step="1"
+                        value={config.maxItems ?? 30}
+                        onChange={(e) => setConfig((c) => ({ ...c, maxItems: Number(e.target.value) }))}
+                        className="flex-1 h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer accent-purple-500"
+                      />
+                      <span className="text-sm font-medium w-8 text-center">{config.maxItems ?? 30}</span>
+                    </div>
+                    <p className="text-xs text-muted-foreground">设置每次抓取新岗位的最大条数 (10-80)</p>
                   </div>
                 </div>
               )}

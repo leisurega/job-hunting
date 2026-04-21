@@ -94,9 +94,6 @@ public class PlaywrightManager {
     @Getter
     private final List<Long> lastJob51Ids = new CopyOnWriteArrayList<>();
 
-    // 记录智联招聘是否已处理过未登录引导（仅初始化时执行一次）
-    private volatile boolean zhilianLoginGuided = false;
-
     // 默认超时时间（毫秒）
   private static final int DEFAULT_TIMEOUT = 30000;
 
@@ -662,56 +659,11 @@ public class PlaywrightManager {
 
     /**
      * 检查猎聘是否已登录
-     * 已登录：能找到用户头像 <img class="header-quick-menu-user-photo" ...>
-     * 未登录：能找到 <span id="header-quick-menu-login">登录/注册</span>
+     * 纯只读检查，无副作用
      */
     private boolean checkIfLiepinLoggedIn() {
         try {
-            // 先检查“登录/注册”入口是否可见，若可见则明确未登录
-            try {
-                Locator loginEntry = liepinPage.locator(
-                    "#header-quick-menu-login, a[href*='login'], a[data-key='login'], button[data-key='login'], text=/登录|注册/").first();
-                if (loginEntry.isVisible()) {
-                    log.info("检测到未登录猎聘，保持在登录页或首页等待扫码登录");
-                    // 若不在登录页，则导航到登录页并尝试切换二维码
-                    String currentUrl = null;
-                    try { currentUrl = liepinPage.url(); } catch (Exception ignored) {}
-                    try {
-                        if (currentUrl == null || !currentUrl.contains("/login")) {
-                            liepinPage.navigate("https://www.liepin.com/login");
-                            try { Thread.sleep(800); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
-                        }
-                        // 优先点击官方切换二维码的容器
-                        Locator qrSwitch = liepinPage.locator(".switch-type-mask-img-box").first();
-                        if (qrSwitch.isVisible()) {
-                            qrSwitch.click();
-                            log.info("已切换到猎聘二维码登录页面，等待用户扫码...");
-                        } else {
-                            // 兼容新版页面：图片资源名包含 qrcode-btn，需要点击其父级按钮
-                            Locator qrImg = liepinPage.locator("img[src*='qrcode-btn']").first();
-                            if (qrImg.count() > 0 && qrImg.isVisible()) {
-                                try {
-                                    // 尝试点击父节点或最近的可点击容器
-                                    qrImg.click();
-                                } catch (Exception ignored) {
-                                    try {
-                                        Locator parentBtn = qrImg.locator("xpath=ancestor::button[1] | xpath=ancestor::*[contains(@class,'btn')][1]").first();
-                                        if (parentBtn.count() > 0 && parentBtn.isVisible()) {
-                                            parentBtn.click();
-                                        }
-                                    } catch (Exception ignored2) {}
-                                }
-                                log.info("已通过二维码按钮切换到扫码登录状态");
-                            }
-                        }
-                    } catch (Exception e) {
-                        log.debug("猎聘登录页引导/二维码切换失败: {}", e.getMessage());
-                    }
-                    return false;
-                }
-            } catch (Exception ignored) {}
-
-            // 再检查已登录特征：用户信息容器或用户头像是否存在（无需强制可见）
+            // 1) 已登录优先：header 头像/信息节点出现即判定已登录
             try {
                 if (liepinPage.locator("#header-quick-menu-user-info").count() > 0) {
                     log.debug("猎聘登录检测：存在用户信息容器，判定已登录");
@@ -726,21 +678,29 @@ public class PlaywrightManager {
                 }
             } catch (Exception ignored) {}
 
-            // 兜底：若不存在登录入口且也未找到明确已登录特征，按已登录处理（避免误判）
+            // 2) 未登录特征：精确 ID 选择器
             try {
-                boolean loginEntryExists = liepinPage.locator("#header-quick-menu-login, a[href*='login']").count() > 0;
-                if (!loginEntryExists) {
-                    log.info("猎聘登录检测：未发现登录入口，兜底判定为已登录");
-                    return true;
+                Locator loginEntry = liepinPage.locator("#header-quick-menu-login").first();
+                if (loginEntry.count() > 0 && loginEntry.isVisible()) {
+                    log.debug("猎聘登录检测：检测到未登录入口，判定未登录");
+                    return false;
                 }
             } catch (Exception ignored) {}
 
-            // 默认未登录
-            log.debug("猎聘登录检测：未匹配到明确特征，判定未登录");
-            return false;
+            // 3) URL 兜底：在登录域名下，多半未登录
+            try {
+                String url = liepinPage.url();
+                if (url != null && url.contains("/login")) {
+                    log.debug("猎聘登录检测：当前处于登录页，判定未登录");
+                    return false;
+                }
+            } catch (Exception ignored) {}
+
+            // 4) 均未匹配：沿用当前缓存状态，避免抖动
+            return Boolean.TRUE.equals(loginStatus.get("liepin"));
         } catch (Exception e) {
             log.debug("猎聘登录检测异常: {}", e.getMessage());
-            return false;
+            return Boolean.TRUE.equals(loginStatus.get("liepin"));
         }
     }
 
@@ -1053,6 +1013,9 @@ public class PlaywrightManager {
                 job51Page = context.newPage();
             }
 
+            // 将 51job 标签页前置，便于用户扫码
+            try { job51Page.bringToFront(); } catch (Exception ignored) {}
+
             // 如果已登录则直接返回
             if (checkIf51jobLoggedIn()) {
                 log.info("检测到已登录51job，跳过登录触发");
@@ -1158,7 +1121,7 @@ public class PlaywrightManager {
 
     /**
      * 检查智联招聘是否已登录
-     * 未登录时只在首次检测时引导用户到登录页
+     * 纯只读检查，无副作用
      */
     private boolean checkIfZhilianLoggedIn() {
         try {
@@ -1166,120 +1129,45 @@ public class PlaywrightManager {
                 return false;
             }
 
-            boolean isLoggedIn = false;
-            boolean loginButtonExists = false;
-
-            // 检查是否存在"登录/注册"按钮
-            try {
-                Locator loginButton = zhilianPage.locator("a.home-header__c-no-login").first();
-                int count = loginButton.count();
-                if (count > 0) {
-                    loginButtonExists = true;
-                    // 尝试获取文本进一步确认
-                    try {
-                        String buttonText = loginButton.textContent();
-                        if (buttonText != null && buttonText.contains("登录")) {
-                            loginButtonExists = true;
-                        }
-                    } catch (Exception e) {
-                        log.debug("智联招聘：获取登录按钮文本失败: {}", e.getMessage());
-                    }
-                }
-            } catch (Exception e) {
-                log.debug("智联招聘：检查登录按钮时异常: {}", e.getMessage());
-            }
-
-            // 如果存在登录按钮，说明未登录
-            if (loginButtonExists) {
-                // 只在首次检测到未登录时执行引导操作
-                if (!zhilianLoginGuided) {
-                    log.info("检测到未登录智联招聘，重定向到登录页面");
-                    zhilianLoginGuided = true;
-
-                    // 重定向到登录页面
-                    String currentUrl = null;
-                    try {
-                        currentUrl = zhilianPage.url();
-                    } catch (Exception ignored) {
-                    }
-
-                    try {
-                        if (currentUrl == null || !currentUrl.contains("passport.zhaopin.com/login")) {
-                            boolean loginNavOk = false;
-                            try {
-                                zhilianPage.navigate(
-                                        "https://passport.zhaopin.com/login",
-                                        new Page.NavigateOptions()
-                                                .setTimeout(60000)
-                                                .setWaitUntil(WaitUntilState.DOMCONTENTLOADED)
-                                );
-                                loginNavOk = true;
-                            } catch (Exception navEx) {
-                                String urlAfter = null;
-                                try {
-                                    urlAfter = zhilianPage.url();
-                                } catch (Exception ignored2) {}
-
-                                if (urlAfter != null && urlAfter.contains("passport.zhaopin.com")) {
-                                    loginNavOk = true;
-                                    log.debug("智联招聘：登录页导航异常但已在登录域: {}", navEx.getMessage());
-                                } else {
-                                    log.warn("智联招聘：导航至登录页失败: {}", navEx.getMessage());
-                                }
-                            }
-
-                            if (loginNavOk) {
-                                try {
-                                    zhilianPage.waitForLoadState(LoadState.DOMCONTENTLOADED);
-                                } catch (Exception ignored) {}
-                                try {
-                                    zhilianPage.waitForSelector(
-                                            "div.zppp-panel-normal-bar__img, " +
-                                            "div.passport-login, #J_loginWrap, " +
-                                            "div[class*='qrcode'], img[src*='qrcode']",
-                                            new Page.WaitForSelectorOptions().setTimeout(30000)
-                                    );
-                                } catch (Exception e) {
-                                    log.debug("智联招聘：登录页关键元素等待失败: {}", e.getMessage());
-                                }
-                            }
-                        }
-
-                        // 点击二维码登录按钮
-                        Locator qrToggle = zhilianPage.locator("div.zppp-panel-normal-bar__img").first();
-                        if (qrToggle.count() > 0 && qrToggle.isVisible()) {
-                            qrToggle.click(new Locator.ClickOptions().setTimeout(DEFAULT_TIMEOUT));
-                            log.info("已切换到智联二维码登录页面，等待用户扫码...");
-                        } else {
-                            log.info("智联招聘登录页面已打开，等待用户扫码...");
-                        }
-                    } catch (Exception e) {
-//                        log.warn("智联招聘：打开二维码登录面板失败: {}", e.getMessage());
-                    }
-                }
-                return false;
-            }
-
-            // 检查是否有已登录的特征
+            // 1) 已登录特征：URL 包含 i.zhaopin.com 或用户信息元素出现
             try {
                 String url = zhilianPage.url();
                 if (url != null && url.contains("i.zhaopin.com")) {
                     log.debug("智联招聘：URL包含i.zhaopin.com，判定为已登录");
-                    isLoggedIn = true;
+                    return true;
                 }
-            } catch (Exception ignore) {
-            }
+            } catch (Exception ignored) {}
 
-            // 如果没有登录按钮，也认为已登录
-            if (!loginButtonExists) {
-                log.debug("智联招聘：未检测到登录按钮，判定为已登录");
-                isLoggedIn = true;
-            }
+            try {
+                if (zhilianPage.locator(".user-info, .user-name, .username-text").count() > 0) {
+                    log.debug("智联招聘：存在用户信息元素，判定为已登录");
+                    return true;
+                }
+            } catch (Exception ignored) {}
 
-            return isLoggedIn;
+            // 2) 未登录特征：存在“登录/注册”按钮
+            try {
+                Locator loginButton = zhilianPage.locator("a.home-header__c-no-login").first();
+                if (loginButton.count() > 0 && loginButton.isVisible()) {
+                    log.debug("智联招聘：检测到未登录入口，判定未登录");
+                    return false;
+                }
+            } catch (Exception ignored) {}
+
+            // 3) URL 兜底：在登录域下
+            try {
+                String url = zhilianPage.url();
+                if (url != null && url.contains("passport.zhaopin.com/login")) {
+                    log.debug("智联招聘：当前处于登录页，判定未登录");
+                    return false;
+                }
+            } catch (Exception ignored) {}
+
+            // 4) 均未匹配：沿用当前缓存状态，避免抖动
+            return Boolean.TRUE.equals(loginStatus.get("zhilian"));
         } catch (Exception e) {
             log.warn("智联招聘：检查登录状态异常: {}", e.getMessage());
-            return false;
+            return Boolean.TRUE.equals(loginStatus.get("zhilian"));
         }
     }
 
@@ -1321,6 +1209,122 @@ public class PlaywrightManager {
     }
 
     /**
+     * 主动触发 Boss 直聘登录：前置标签页并跳转登录页 + 切换二维码
+     */
+    public void triggerBossLogin() {
+        try {
+            if (bossPage == null) {
+                if (context == null) {
+                    throw new IllegalStateException("浏览器上下文尚未初始化");
+                }
+                bossPage = context.newPage();
+            }
+
+            // 将 Boss 标签页前置，便于用户扫码
+            try { bossPage.bringToFront(); } catch (Exception ignored) {}
+
+            if (checkIfLoggedIn()) {
+                log.info("检测到已登录 Boss，跳过登录触发");
+                setLoginStatus("boss", true);
+                return;
+            }
+
+            // 跳转到 Boss 登录页
+            try {
+                bossPage.navigate(BOSS_URL + "/web/user/?ka=header-login", new Page.NavigateOptions()
+                        .setTimeout(60000)
+                        .setWaitUntil(WaitUntilState.DOMCONTENTLOADED));
+            } catch (Exception e) {
+                log.debug("Boss 登录页导航异常: {}", e.getMessage());
+            }
+
+            // 尝试切换到二维码登录
+            try {
+                Locator qrSwitch = bossPage.locator(".btn-sign-switch.ewm-switch").first();
+                if (qrSwitch.isVisible()) {
+                    qrSwitch.click();
+                    log.info("已切换到 Boss 二维码登录");
+                } else {
+                    Locator tip = bossPage.getByText("APP扫码登录").first();
+                    if (tip.isVisible()) {
+                        tip.click();
+                    } else {
+                        Locator legacy = bossPage.locator("li.sign-switch-tip").first();
+                        if (legacy.isVisible()) {
+                            legacy.click();
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                log.debug("Boss 二维码切换失败: {}", e.getMessage());
+            }
+        } catch (Exception e) {
+            log.error("触发 Boss 登录流程失败: {}", e.getMessage(), e);
+            throw new RuntimeException("触发 Boss 登录流程失败", e);
+        }
+    }
+
+    /**
+     * 主动触发猎聘登录：前置标签页并跳转登录页 + 切换二维码
+     */
+    public void triggerLiepinLogin() {
+        try {
+            if (liepinPage == null) {
+                if (context == null) {
+                    throw new IllegalStateException("浏览器上下文尚未初始化");
+                }
+                liepinPage = context.newPage();
+            }
+
+            // 将猎聘标签页前置，便于用户扫码
+            try { liepinPage.bringToFront(); } catch (Exception ignored) {}
+
+            if (checkIfLiepinLoggedIn()) {
+                log.info("检测到已登录猎聘，跳过登录触发");
+                setLoginStatus("liepin", true);
+                return;
+            }
+
+            // 跳转到猎聘登录页
+            try {
+                liepinPage.navigate("https://www.liepin.com/login", new Page.NavigateOptions()
+                        .setTimeout(60000)
+                        .setWaitUntil(WaitUntilState.DOMCONTENTLOADED));
+            } catch (Exception e) {
+                log.debug("猎聘登录页导航异常: {}", e.getMessage());
+            }
+
+            // 尝试切换到二维码登录
+            try {
+                Locator qrSwitch = liepinPage.locator(".switch-type-mask-img-box").first();
+                if (qrSwitch.isVisible()) {
+                    qrSwitch.click();
+                    log.info("已切换到猎聘二维码登录");
+                } else {
+                    Locator qrImg = liepinPage.locator("img[src*='qrcode-btn']").first();
+                    if (qrImg.count() > 0 && qrImg.isVisible()) {
+                        try {
+                            qrImg.click();
+                        } catch (Exception ignored) {
+                            try {
+                                Locator parentBtn = qrImg.locator("xpath=ancestor::button[1] | xpath=ancestor::*[contains(@class,'btn')][1]").first();
+                                if (parentBtn.count() > 0 && parentBtn.isVisible()) {
+                                    parentBtn.click();
+                                }
+                            } catch (Exception ignored2) {}
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                log.debug("猎聘二维码切换失败: {}", e.getMessage());
+            }
+        } catch (Exception e) {
+            log.error("触发猎聘登录流程失败: {}", e.getMessage(), e);
+            throw new RuntimeException("触发猎聘登录流程失败", e);
+        }
+    }
+
+    /**
      * 主动触发智联招聘登录：点击二维码入口并等待登录成功跳转
      */
     public void triggerZhilianLogin() {
@@ -1328,6 +1332,9 @@ public class PlaywrightManager {
             if (zhilianPage == null) {
                 throw new IllegalStateException("智联招聘页面未初始化");
             }
+
+            // 将智联标签页前置，便于用户扫码
+            try { zhilianPage.bringToFront(); } catch (Exception ignored) {}
 
             // 导航到智联首页，确保DOM就绪
             zhilianPage.navigate(ZHILIAN_URL, new Page.NavigateOptions()
@@ -1776,10 +1783,11 @@ public class PlaywrightManager {
         if (previousStatus == null || previousStatus != isLoggedIn) {
             loginStatus.put(platform, isLoggedIn);
 
-            // Boss平台：在设置未登录状态时，顺带引导到登录页并切换二维码扫码
-            if ("boss".equals(platform) && !isLoggedIn) {
+            // Boss平台：仅在「从已登录变为未登录」的跳变时，执行自动跳转登录页引导
+            if ("boss".equals(platform) && !isLoggedIn && Boolean.TRUE.equals(previousStatus)) {
                 try {
                     if (bossPage != null) {
+                        log.info("Boss 平台登录态失效，自动跳转到登录页进行引导");
                         String currentUrl = null;
                         try { currentUrl = bossPage.url(); } catch (Exception ignored) {}
 

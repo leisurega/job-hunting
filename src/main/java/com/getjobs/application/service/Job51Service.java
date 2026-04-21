@@ -78,6 +78,9 @@ public class Job51Service {
         }
         config.setSalary(salaryCodes);
 
+        // 每次抓取最大条数
+        config.setMaxItems(entity.getMaxItems() != null ? entity.getMaxItems() : 30);
+
         return config;
     }
 

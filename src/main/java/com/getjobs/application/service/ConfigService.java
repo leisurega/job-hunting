@@ -245,6 +245,9 @@ public class ConfigService {
             config.setSalary((codeByName != null && !codeByName.isEmpty()) ? codeByName : salaryCode.trim());
         }
 
+        // 每次抓取最大条数
+        config.setMaxItems(entity != null && entity.getMaxItems() != null ? entity.getMaxItems() : 30);
+
         return config;
     }
 
